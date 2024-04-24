@@ -13,7 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 from absl import logging
-from typing import Iterable, List, Tuple, Mapping, Text, Any
+from typing import Callable, Iterable, List, Optional, Tuple, Mapping, Text, Any
 from pathlib import Path
 import sys
 import signal
@@ -49,6 +49,9 @@ def run_self_play(
     train_steps_counter: multiprocessing.Value,
     stop_event: multiprocessing.Event,
     tag: str = None,
+    no_mask: bool = False,
+    action_decoder: Optional[Callable] = None,
+    action_encoder: Optional[Callable] = None,
 ) -> None:
     """Run self-play for as long as needed, only stop if `stop_event` is set to True.
 
@@ -91,24 +94,34 @@ def run_self_play(
         while not done and not stop_event.is_set():
             # Make a copy of current player id.
             player_id = copy.deepcopy(env.current_player)
-
+            # print(" ================= obs shape: ", obs.shape)
             action, pi_prob, root_value = uct_search(
                 state=obs,
                 network=network,
                 device=device,
                 config=config,
                 temperature=config.visit_softmax_temperature_fn(steps, train_steps_counter.value),
-                actions_mask=env.actions_mask,
+                actions_mask=env.actions_mask,#None if no_mask else env.actions_mask,
                 current_player=env.current_player,
                 opponent_player=env.opponent_player,
+                action_encoder=action_encoder,
             )
+            
+            # if action_decoder is not None:
+                # action = action_decoder(action)
+            # print(" ================= action: ", action)
 
             next_obs, reward, done, _ = env.step(action)
             steps += 1
-
+            action = action if action_encoder is None else action_encoder(action)
+            pi_prob = pi_prob if action_encoder is None else action_encoder(pi_prob.argmax()).cpu().numpy()
             for tracker in trackers:
                 tracker.step(reward, done)
 
+            if not isinstance(action, torch.Tensor):
+                print(" ================= action: ", action)
+                print(" ================= type(action): ", type(action))
+                print(" ================= step: ", steps)
             episode_trajectory.append((obs, action, reward, pi_prob, root_value, player_id))
             obs = next_obs
 
@@ -119,6 +132,7 @@ def run_self_play(
                 not config.is_board_game
                 and len(episode_trajectory) == config.acc_seq_length + config.unroll_steps + config.td_steps
             ):
+                print("send extra sequence")
                 # Unpack list of tuples into seperate lists.
                 observations, actions, rewards, pi_probs, root_values, _ = map(list, zip(*episode_trajectory))
                 # Compute n_step target value.
@@ -155,11 +169,17 @@ def run_self_play(
 
         priorities = np.abs(np.array(root_values) - np.array(target_values))
 
+        print(" ================= len(episode_trajectory): ", len(episode_trajectory))
+        print(" ================= sending full sequence")
         # Make unroll sequences and send to learner.
-        for transition, priority in make_unroll_sequence(
-            observations, actions, rewards, pi_probs, target_values, priorities, config.unroll_steps
-        ):
-            data_queue.put((transition, priority))
+        try:
+            for transition, priority in make_unroll_sequence(
+                observations, actions, rewards, pi_probs, target_values, priorities, config.unroll_steps
+            ):
+                data_queue.put((transition, priority))
+        except Exception as e:
+            print(" ================= error: ", e)
+            print(" ================= actions: ", actions)
 
         del episode_trajectory[:]
         del (observations, actions, rewards, pi_probs, root_values, priorities, player_ids, target_values)
@@ -297,6 +317,7 @@ def run_board_game_evaluator(
     stop_event: multiprocessing.Event,
     initial_elo: int = -2000,
     tag: str = None,
+    action_decoder: Optional[Callable] = None,
 ) -> None:
     """
     Monitoring training progress by play a single game with new checkpoint againt last checkpoint.
@@ -382,7 +403,9 @@ def run_board_game_evaluator(
                 opponent_player=env.opponent_player,
                 deterministic=True,
             )
-
+            if action_decoder is not None:
+                action = action_decoder(action)
+                
             obs, _, done, _ = env.step(action)
 
         if env.winner == env.black_player_id:
@@ -407,6 +430,9 @@ def run_evaluator(
     stop_event: multiprocessing.Event,
     tag: str = None,
     num_episodes: int = 1,
+    no_mask: bool = False,
+    action_decoder: Optional[Callable] = None,
+    action_encoder: Optional[Callable] = None,
 ) -> None:
     """
     Monitoring training progress by play few games with the most recent new checkpoint.
@@ -471,11 +497,15 @@ def run_evaluator(
                     device=device,
                     config=config,
                     temperature=temperature,
-                    actions_mask=env.actions_mask,
+                    actions_mask=None if no_mask else env.actions_mask,
                     current_player=env.current_player,
                     opponent_player=env.opponent_player,
                     deterministic=True,
+                    action_encoder=action_encoder,
                 )
+                
+                if action_decoder is not None:
+                    action = action_decoder(action)
 
                 obs, reward, done, _ = env.step(action)
                 steps += 1
@@ -549,11 +579,13 @@ def calc_loss(
     state = torch.from_numpy(transitions.state).to(device=device, dtype=torch.float32, non_blocking=True)
     # [B, T]
     action = torch.from_numpy(transitions.action).to(device=device, dtype=torch.long, non_blocking=True)
+    
+    print("action shape in loss: ", action.shape)
     target_value_scalar = torch.from_numpy(transitions.value).to(device=device, dtype=torch.float32, non_blocking=True)
     target_reward_scalar = torch.from_numpy(transitions.reward).to(device=device, dtype=torch.float32, non_blocking=True)
     # [B, T, num_actions]
     target_pi_prob = torch.from_numpy(transitions.pi_prob).to(device=device, dtype=torch.float32, non_blocking=True)
-
+    print("target_pi_prob shape: ", target_pi_prob.shape)
     # Convert scalar targets into transformed support (probabilities).
     if network.mse_loss_for_value:
         target_value = target_value_scalar
@@ -566,9 +598,17 @@ def calc_loss(
         # [B, T, num_actions]
         target_reward = scalar_to_categorical_probabilities(target_reward_scalar, network.reward_support_size)
 
-    B, T = action.shape
+    B, T, V = action.shape
     reward_loss, value_loss, policy_loss = (0, 0, 0)
     loss_scale = 1.0 / T
+
+    lengths = torch.sqrt(torch.sum(action ** 2, axis=-1))
+
+    # Calculate the regularization term
+    regularization_term = torch.sum((lengths - 1) ** 2)
+
+    # Define the regularization coefficient
+    lambda_coefficient = 0.1  # This is a hyperparameter that you can tune
 
     pred_values = []
 
@@ -578,7 +618,11 @@ def calc_loss(
     # Unroll K steps.
     for t in range(T):
         pred_pi_logits, pred_value = network.prediction(hidden_state)
-        hidden_state, pred_reward = network.dynamics(hidden_state, action[:, t].unsqueeze(1))
+        print("pred_pi_logits shape: ", pred_pi_logits.shape)
+        print("pred_value shape: ", pred_value.shape)
+        action_slice = action[:, t, :]
+        print("action slice shape: ", action_slice.shape)
+        hidden_state, pred_reward = network.dynamics(hidden_state, action_slice)
 
         # Scale the gradient for dynamics function by 0.5.
         hidden_state.register_hook(lambda grad: grad * 0.5)
@@ -591,10 +635,11 @@ def calc_loss(
 
         pred_values.append(pred_value.detach())
 
-    loss = reward_loss + value_loss + policy_loss
+    loss = reward_loss + value_loss + policy_loss + lambda_coefficient * regularization_term
 
     # Scale loss using importance sampling weights, then average over batch dimension B.
     loss = torch.mean(loss * weights.detach())
+    print("loss: ", loss)
 
     # Scale the loss by 1/unroll_steps.
     loss.register_hook(lambda grad: grad * loss_scale)
@@ -614,6 +659,8 @@ def calc_loss(
 
 def loss_func(prediction: torch.Tensor, target: torch.Tensor, mse: bool = False) -> torch.Tensor:
     """Loss function for MuZero agent's value and reward."""
+    print("prediction shape: ", prediction.shape)
+    print("target shape: ", target.shape)
     assert prediction.shape == target.shape
 
     if not mse:
@@ -709,6 +756,67 @@ def compute_mc_return_target(rewards: List[float], player_ids: List[float]) -> L
 
 def make_unroll_sequence(
     observations: List[np.ndarray],
+    actions: List[np.ndarray],
+    rewards: List[float],
+    pi_probs: List[np.ndarray],
+    values: List[float],
+    priorities: List[float],
+    unroll_steps: int,
+) -> Iterable[Transition]:
+    """Turn a lists of episode history into a list of structured transition object,
+    and stack unroll_steps for actions, rewards, values, MCTS policy.
+
+    Args:
+        observations: a list of history environment observations.
+        actions: a list of history actual actions taken in the environment.
+        rewards: a list of history reward received from the environment.
+        pi_probs: a list of history policy probabilities from the MCTS search result.
+        values: a list of n-step target value.
+        priorities: a list of priorities for each transition.
+        unroll_steps: number of unroll steps during traning.
+
+    Returns:
+        yeilds tuple of structured Transition object and the associated priority for the specific transition.
+
+    """
+
+    T = len(observations)
+
+    # States past the end of games are treated as absorbing states.
+    if len(actions) == T:
+        actions += [torch.zeros_like(actions[0], dtype=actions[0].dtype)] * unroll_steps
+    if len(rewards) == T:
+        rewards += [0] * unroll_steps
+    if len(values) == T:
+        values += [0] * unroll_steps
+    if len(pi_probs) == T:
+        absorb_policy = np.ones_like(pi_probs[-1]) / len(pi_probs[-1])
+        pi_probs += [absorb_policy] * unroll_steps
+
+    assert len(actions) == len(rewards) == len(values) == len(pi_probs) == T + unroll_steps
+
+    for t in range(T):
+        end_index = t + unroll_steps
+        action_sequence = torch.stack([action.cpu().float() for action in actions[t:end_index]])
+        stacked_action = action_sequence.numpy()
+        stacked_reward = np.array(rewards[t:end_index], dtype=np.float32)
+        stacked_value = np.array(values[t:end_index], dtype=np.float32)
+        stacked_pi_prob = np.array(pi_probs[t:end_index], dtype=np.float32)
+
+        yield (
+            Transition(
+                state=observations[t],  # no stacking for observation, since it is only used to get initial hidden state.
+                action=stacked_action,
+                reward=stacked_reward,
+                value=stacked_value,
+                pi_prob=stacked_pi_prob,
+            ),
+            priorities[t],
+        )
+        
+        
+def _make_unroll_sequence(
+    observations: List[np.ndarray],
     actions: List[int],
     rewards: List[float],
     pi_probs: List[np.ndarray],
@@ -750,7 +858,7 @@ def make_unroll_sequence(
 
     for t in range(T):
         end_index = t + unroll_steps
-        stacked_action = np.array(actions[t:end_index], dtype=np.int8)
+        stacked_action = np.array(actions[t:end_index], dtype=np.float32)
         stacked_reward = np.array(rewards[t:end_index], dtype=np.float32)
         stacked_value = np.array(values[t:end_index], dtype=np.float32)
         stacked_pi_prob = np.array(pi_probs[t:end_index], dtype=np.float32)
@@ -785,9 +893,9 @@ def handle_exit_signal():
         sys.exit(128 + signal_code)
 
     # Listen to signals to exit process.
-    signal.signal(signal.SIGHUP, shutdown)
+    signal.signal(signal.SIGABRT, shutdown)
     signal.signal(signal.SIGINT, shutdown)
-    signal.signal(signal.SIGTERM, shutdown)
+    # signal.signal(signal.SIGTERM, shutdown)
 
 
 def get_time_stamp(as_file_name: bool = False) -> str:

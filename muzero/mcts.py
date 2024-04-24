@@ -95,6 +95,7 @@ class Node:
         self.hidden_state = hidden_state
         self.reward = reward
         self.player_id = player_id
+        # print(f"prior in expand: {prior.shape}")
         for action in range(0, prior.shape[0]):
             child = Node(prior=prior[action], move=action, parent=self)
             self.children.append(child)
@@ -300,6 +301,123 @@ def set_illegal_action_probs_to_zero(actions_mask: np.ndarray, prob: np.ndarray)
 
 
 def uct_search(
+    state: np.ndarray,
+    network: MuZeroNet,
+    device: torch.device,
+    config: MuZeroConfig,
+    temperature: float,
+    actions_mask: np.ndarray,
+    current_player: int,
+    opponent_player: int,
+    deterministic: bool = False,
+    action_encoder: Optional[callable] = None,
+) -> Tuple[int, np.ndarray, float]:
+    """Single-threaded Upper Confidence Bound (UCB) for Trees (UCT) search without any rollout.
+
+    It follows the following general UCT search algorithm.
+    ```
+    function UCTSEARCH(r,m)
+      i←1
+      for i ≤ m do
+          n ← select(r)
+          n ← expand_node(n)
+          ∆ ← playout(n)
+          update_statistics(n,∆)
+      end for
+      return end function
+    ```
+
+    Args:
+        state: current observation from the environment.
+        network: MuZero network instance.
+        device: PyTorch runtime device.
+        config: a MuZeroConfig instance.
+        temperature: a parameter controls the level of exploration
+            when generate policy action probabilities after MCTS search.
+        actions_mask: a 1D bool numpy.array contains valid action masks, with True for valid actions, False for invalid actions.
+        current_player: current player id in the environment.
+        opponent_player: opponent player id in the environment.
+        deterministic: after the MCTS search, choose the child node with most visits number to play in the real environment,
+         instead of sample through a probability distribution, default off.
+
+    Returns:
+        tuple contains:
+            a integer indicate the sampled action to play in the environment.
+            a 1D numpy.array search policy action probabilities from the MCTS search result.
+            a float represent the search value of the root node.
+
+    """
+
+    if config.is_board_game:
+        assert config.discount == 1.0
+
+    min_max_stats = MinMaxStats(config.known_bounds)
+
+    # Create root node
+    state = torch.from_numpy(state).to(device=device, dtype=torch.float32)
+    network_output = network.initial_inference(state[None, ...])
+    prior_prob = network_output.pi_probs
+    root_node = Node(prior=0.0)
+    
+    if action_encoder is not None:
+        # print(f"encoder actions: {len(action_encoder.get_action_embeddings())}; prior: {prior_prob.shape}, mask: {actions_mask.shape}")
+        prior_prob = np.ones(actions_mask.shape, dtype=np.float32)
+    
+    # Add dirichlet noise to the prior probabilities to root node.
+    if not deterministic and config.root_dirichlet_alpha > 0.0 and config.root_exploration_eps > 0.0:
+        prior_prob = add_dirichlet_noise(prior_prob, eps=config.root_exploration_eps, alpha=config.root_dirichlet_alpha)
+    # Set prior probabilities to zero for illegal actions.
+    if actions_mask is not None:
+        prior_prob = set_illegal_action_probs_to_zero(actions_mask, prior_prob)
+
+    # prior_prob = np.ones(len(action_encoder.get_action_embeddings()), dtype=np.float32)
+    root_node.expand(prior_prob, current_player, network_output.hidden_state, network_output.reward)
+
+    for _ in range(config.num_simulations):
+        # Phase 1 - Select
+        # Select best child node until reach a leaf node
+        node = root_node
+        curr_player = current_player
+        oppo_player = opponent_player
+
+        while node.is_expanded:
+            node = node.best_child(min_max_stats, config)
+            # Switch players as in board games.
+            curr_player, oppo_player = (oppo_player, curr_player)
+
+        # Phase 2 - Expand and evaluation
+        hidden_state = torch.from_numpy(node.parent.hidden_state).to(device=device, dtype=torch.float32)
+        if action_encoder is not None:
+            action = action_encoder(node.move)
+        else:
+            action = torch.tensor([node.move], dtype=torch.long, device=device)
+        network_output = network.recurrent_inference(hidden_state[None, ...], action[None, ...])
+
+        node.expand(prior_prob, curr_player, network_output.hidden_state, network_output.reward)
+
+        # Phase 3 - Backup on leaf node
+        node.backup(network_output.value, curr_player, min_max_stats, config)
+
+    # Play - generate action probability from the root node.
+    child_visits = root_node.child_N
+    # Maskout illegal actions.
+    if actions_mask is not None:
+        child_visits = np.where(actions_mask, child_visits, 0)
+
+    pi_prob = generate_play_policy(child_visits, temperature)
+
+    if deterministic:
+        # Choose the action with most visit number.
+        action_index = np.argmax(child_visits)
+    else:
+        # Sample a action.
+        action_index = np.random.choice(np.arange(pi_prob.shape[0]), p=pi_prob)
+
+    action = root_node.children[action_index].move
+    return (action, pi_prob, root_node.Q)
+
+
+def continous_uct_search(
     state: np.ndarray,
     network: MuZeroNet,
     device: torch.device,

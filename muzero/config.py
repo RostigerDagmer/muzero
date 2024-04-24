@@ -219,7 +219,7 @@ def make_atari_config(
         lr_milestones=[100e3, 200e3],
         visit_softmax_temperature_fn=atari_visit_softmax_temperature_fn,
         num_training_steps=num_training_steps,
-        num_planes=128,  # 256
+        num_planes=512, # 256
         num_res_blocks=8,  # 16
         hidden_dim=0,
         value_support_size=61,  # 601

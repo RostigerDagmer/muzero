@@ -90,6 +90,7 @@ class MuZeroNet(nn.Module):
         and use prediction function to predict policy probabilities and state value (on new hidden state).
         The reward and state value are scalars."""
         # Dynamics function
+        
         hidden_state, reward = self.dynamics(hidden_state, action)
 
         if not self.mse_loss_for_reward:
@@ -572,3 +573,4 @@ class MuZeroBoardGameNet(MuZeroNet):  # pylint: disable=abstract-method
 
     def prediction(self, hidden_state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         return self.prediction_net(hidden_state)
+

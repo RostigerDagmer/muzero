@@ -351,6 +351,70 @@ class StackFrameAndAction(gym.ObservationWrapper):
             plane = np.ones((1,)).astype(np.float32)
 
         return sacled_action * plane
+    
+class StackFrame(gym.ObservationWrapper):
+    """Stack observation history as well as last action as a bias plane.
+    Need to make sure the env is already channel first for Atari games.
+    """
+
+    def __init__(self, env: gym.Env, stack_history: int, is_obs_image: bool):
+        super().__init__(env)
+        self.stack_history = stack_history
+        self.is_obs_image = is_obs_image
+
+        if is_obs_image:
+            old_channels = env.observation_space.shape[0]  # Channel first
+            self.old_obs_shape = env.observation_space.shape[1:]  # [H, W]
+            # [num_stack, H, W] for gray scale images.
+            # [num_stack x3, H, W] for RGB images.
+            new_obs_shape = (self.stack_history * (old_channels),)
+        else:
+            self.old_obs_shape = env.observation_space.shape
+            obs_shape = env.observation_space.shape[0]
+            # [num_stack, original shape + 1]
+            new_obs_shape = (self.stack_history, obs_shape)
+
+        self.observation_space = Box(
+            low=np.min(env.observation_space.low),
+            high=np.max(env.observation_space.high),
+            shape=new_obs_shape,
+            dtype=np.float32,
+        )
+
+        self.obs_storage = deque([], maxlen=self.stack_history)
+        self.reset()
+
+    def observation(self, observation):
+        stacked_obs = np.stack(list(self.obs_storage), axis=0).astype(np.float32)
+        if self.is_obs_image:
+            # Merge stack and channel dimensions.
+            stacked, channel, h, w = stacked_obs.shape
+            stacked_obs = stacked_obs.reshape((-1, h, w))
+            return stacked_obs  # [num_stack x 2, H, W]
+
+        return stacked_obs  # [num_stack, original shape + 1]
+
+    def step(self, action):
+        observation, reward, done, info = self.env.step(action)
+        self.obs_storage.appendleft(observation)
+
+        return self.observation(None), reward, done, info
+
+    def reset(self, **kwargs):
+        if kwargs.get('return_info', False):
+            obs, info = self.env.reset(**kwargs)
+        else:
+            obs = self.env.reset(**kwargs)
+            info = None  # Unused
+
+        for _ in range(self.stack_history):
+            self.obs_storage.append(obs)
+
+        if kwargs.get('return_info', False):
+            return self.observation(None), info
+        else:
+            return self.observation(None)
+
 
 
 class PlayerIdAndActionMaskWrapper(gym.Wrapper):
@@ -377,6 +441,8 @@ def create_atari_environment(
     terminal_on_life_loss: bool = False,
     clip_reward: bool = False,
     scale_obs: bool = False,
+    output_actions: bool = False,
+    resize_and_gray: bool = True,
 ) -> gym.Env:
     """
     Process gym env for Atari games according to the Nature DQN paper.
@@ -418,7 +484,8 @@ def create_atari_environment(
         env = DoneOnLifeLoss(env)
     if 'FIRE' in env.unwrapped.get_action_meanings():
         env = FireOnReset(env)
-    env = ResizeAndGrayscaleFrame(env, width=screen_width, height=screen_height)
+    if resize_and_gray:
+        env = ResizeAndGrayscaleFrame(env, width=screen_width, height=screen_height)
     if scale_obs:
         env = ScaledFloatFrame(env)
     if clip_reward:
@@ -427,9 +494,13 @@ def create_atari_environment(
     # The order is important as StackFrameAndAction expects channel first for Atari games.
     env = ObservationChannelFirst(env, True)
     if frame_stack > 1:
-        env = StackFrameAndAction(env, frame_stack, True)
+        # env = StackFrameAndAction(env, frame_stack, True)
+        env = StackFrame(env, frame_stack, True)
 
+        
     env = PlayerIdAndActionMaskWrapper(env)
+    if output_actions:
+        return env, env.unwrapped.get_action_meanings()
     return env
 
 

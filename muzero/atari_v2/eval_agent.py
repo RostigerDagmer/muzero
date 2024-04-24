@@ -16,44 +16,63 @@ from absl import app
 from absl import flags
 from absl import logging
 import os
+from pathlib import Path
+import gym
 import torch
 
-from muzero.network import MuZeroMLPNet
-from muzero.gym_env import create_classic_environment, record_video_env
+from muzero.network import MuZeroAtariNet
 from muzero.pipeline import load_checkpoint
 from muzero.mcts import uct_search
-from muzero.config import make_classic_config
+from muzero.config import make_atari_config
+from muzero.gym_env import create_atari_environment, record_video_env
 
 FLAGS = flags.FLAGS
-flags.DEFINE_string('environment_name', 'CartPole-v1', "Classic problem like 'CartPole-v1', 'LunarLander-v2'")
+flags.DEFINE_string('environment_name', 'BreakoutNoFrameskip-v4', 'Classic problem like Breakout, Pong')
+flags.DEFINE_integer('screen_size', 84, 'Environment frame screen height.')
 flags.DEFINE_integer('stack_history', 4, 'Stack previous states.')
+flags.DEFINE_integer('frame_skip', 4, 'Skip n frames.')
+flags.DEFINE_bool('gray_scale', True, 'Gray scale observation image.')
+flags.DEFINE_bool('clip_reward', True, 'Clip reward in the range [-1, 1], default on.')
+flags.DEFINE_bool('done_on_life_loss', True, 'End of game if loss a life, default on.')
 
 flags.DEFINE_integer('seed', 5, 'Seed the runtime.')
 
 flags.DEFINE_string(
     'load_checkpoint_file',
-    # 'saved_checkpoints/CartPole-v1_train_steps_44800',
-    'checkpoints/CartPole-v1_train_steps_100000_final',
-    # 'saved_checkpoints/LunarLander-v2_train_steps_58400',
+    '',
     'Load the checkpoint from file.',
 )
-flags.DEFINE_string('record_video_dir', 'recordings', 'Record play video.')
+flags.DEFINE_string('record_video_dir', 'recordings/classic', 'Record play video.')
 
 
 def main(argv):
-    """Evaluates MuZero agent on classic control problem."""
+    """Evaluates MuZero agent on Atari games."""
     del argv
 
     runtime_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    eval_env = create_classic_environment(FLAGS.environment_name, FLAGS.seed, FLAGS.stack_history)
+    eval_env = create_atari_environment(
+        FLAGS.environment_name,
+        FLAGS.seed,
+        FLAGS.stack_history,
+        FLAGS.frame_skip,
+        FLAGS.screen_size,
+        clip_reward=FLAGS.clip_reward,
+        done_on_life_loss=FLAGS.done_on_life_loss,
+        grayscale=FLAGS.gray_scale,
+    )
     input_shape = eval_env.observation_space.shape
     num_actions = eval_env.action_space.n
 
-    config = make_classic_config()
+    config = make_atari_config()
 
-    network = MuZeroMLPNet(
-        input_shape, num_actions, config.num_planes, config.value_support_size, config.reward_support_size, config.hidden_dim
+    network = MuZeroAtariNet(
+        input_shape,
+        num_actions,
+        config.num_res_blocks,
+        config.num_planes,
+        config.value_support_size,
+        config.reward_support_size,
     )
 
     # Load states from checkpoint to resume training.
@@ -62,7 +81,7 @@ def main(argv):
         network.load_state_dict(loaded_state['network'])
         logging.info(f'Loaded state from checkpoint {FLAGS.load_checkpoint_file}')
 
-    network.eval().to(runtime_device)
+    network.eval()
 
     if FLAGS.record_video_dir is not None and FLAGS.record_video_dir != '':
         eval_env = record_video_env(eval_env, FLAGS.record_video_dir)

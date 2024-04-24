@@ -63,6 +63,9 @@ def transform_from_2hot(probs: torch.Tensor, min_value: float, max_value: float,
     """Transforms from a categorical distribution to a scalar."""
     support_space = torch.linspace(min_value, max_value, num_bins)
     support_space = support_space.expand_as(probs)
+    support_space = support_space.to(probs.device)
+    # print(f"support_space device: {support_space.device}")
+    # print(f"probs device: {probs.device}")
     scalar = torch.sum(probs * support_space, dim=-1, keepdim=True)
     return scalar
 

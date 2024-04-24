@@ -13,9 +13,9 @@ pyglet==1.5.21
 pygame==2.1.2
 
 # PyTorch
-torch==1.11.0
+torch==2.2.2
 torchsummary==1.5.1
-torchvision==0.12.0
+torchvision==0.17.2
 
 # Utilities
 numpy==1.21.6

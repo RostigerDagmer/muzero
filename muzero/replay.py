@@ -26,10 +26,10 @@ ReplayStructure = TypeVar('ReplayStructure', bound=Tuple[Any, ...])
 
 class Transition(NamedTuple):
     state: Optional[np.ndarray]  # stacked history of observation and actions
-    action: Optional[int]
+    action: Optional[np.ndarray]
     pi_prob: Optional[np.ndarray]
-    value: Optional[float]  # n-step value for atari, (or game final score for board games)
-    reward: Optional[float]
+    value: Optional[float | np.ndarray]  # n-step value for atari, (or game final score for board games)
+    reward: Optional[float | np.ndarray]
 
 
 TransitionStructure = Transition(state=None, action=None, pi_prob=None, value=None, reward=None)

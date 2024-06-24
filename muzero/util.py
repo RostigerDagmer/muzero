@@ -19,6 +19,7 @@ import torch.nn.functional as F
 
 def signed_hyperbolic(x: torch.Tensor, eps: float = 1e-3) -> torch.Tensor:
     """Signed hyperbolic transform, inverse of signed_parabolic."""
+    """ f(x) = sign(x) * (sqrt(|x| + 1) - 1) + eps * x """
     return torch.sign(x) * (torch.sqrt(torch.abs(x) + 1) - 1) + eps * x
 
 

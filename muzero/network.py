@@ -66,10 +66,11 @@ class MuZeroNet(nn.Module):
         The state value is a scalar."""
         # Representation function
         hidden_state = self.represent(x)
-
+        # print("Muzero::initial_inference: input hidden state: ", hidden_state)
         # Prediction function
-        pi_logits, value = self.prediction(hidden_state)
-        pi_probs = F.softmax(pi_logits, dim=1)
+        pi_probs, value = self.prediction(hidden_state)
+        # print("Muzero::initial_inference: prediction network output: ", pi_probs, value)
+        # pi_probs = F.softmax(pi_logits, dim=1)
 
         if not self.mse_loss_for_value:
             value = logits_to_transformed_expected_value(value, self.value_support_size)
@@ -90,16 +91,21 @@ class MuZeroNet(nn.Module):
         and use prediction function to predict policy probabilities and state value (on new hidden state).
         The reward and state value are scalars."""
         # Dynamics function
+        # print("Muzero::recurrent_inference: input hidden state: ", hidden_state)
         
         hidden_state, reward = self.dynamics(hidden_state, action)
+
+        # print("Muzero::recurrent_inference: dynamics network output: ", hidden_state, reward)
 
         if not self.mse_loss_for_reward:
             reward = logits_to_transformed_expected_value(reward, self.reward_support_size)
 
         # Prediction function
-        pi_logits, value = self.prediction(hidden_state)
-        pi_probs = F.softmax(pi_logits, dim=1)
-
+        pi_probs, value = self.prediction(hidden_state)
+        # print("Muzero::recurrent_inference: prediction network output: ", pi_probs, value)
+        # pi_probs = F.softmax(pi_logits, dim=1)
+        if hidden_state.isnan().any():
+            raise ValueError("Neger")
         if not self.mse_loss_for_value:
             value = logits_to_transformed_expected_value(value, self.value_support_size)
 

@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+import multiprocessing.sharedctypes
+import multiprocessing.synchronize
 from absl import logging
-from typing import Callable, Iterable, List, Optional, Tuple, Mapping, Text, Any
+from typing import Callable, Iterable, List, Optional, Tuple, Mapping, Text, Any, TypeVar
 from pathlib import Path
 import sys
 import signal
@@ -23,35 +25,45 @@ import time
 import queue
 import multiprocessing
 import gym
+import logging
 
 import numpy as np
+from numpy.typing import NDArray
 import torch
 import torch.nn.functional as F
 
 from muzero.config import MuZeroConfig
 from muzero.games.env import BoardGameEnv
+from muzero.grokfast import gradfilter_ema
 from muzero.network import MuZeroNet
 from muzero.replay import Transition, PrioritizedReplay
 from muzero.trackers import make_actor_trackers, make_learner_trackers, make_evaluator_trackers
 from muzero.mcts import uct_search
 from muzero.util import scalar_to_categorical_probabilities, logits_to_transformed_expected_value
 from muzero.rating import compute_elo_rating
+from muzero.continous.io import ContinousActionDecoder
+from muzero.continous.net import ContinousMuzeroNet
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 
+
+O = TypeVar('O')
+A = TypeVar('A')
 
 @torch.no_grad()
 def run_self_play(
     config: MuZeroConfig,
     rank: int,
-    network: MuZeroNet,
+    network_config: dict[Any, Any] | MuZeroNet,
     device: torch.device,
-    env: gym.Env,
-    data_queue: multiprocessing.Queue,
+    env: gym.Env[O, A],
+    data_queue: multiprocessing.SimpleQueue, #[tuple[Transition, float]],
     train_steps_counter: multiprocessing.Value,
-    stop_event: multiprocessing.Event,
-    tag: str = None,
+    stop_event: multiprocessing.synchronize.Event,
+    tag: Optional[str] = None,
     no_mask: bool = False,
-    action_decoder: Optional[Callable] = None,
-    action_encoder: Optional[Callable] = None,
+    use_distance: Optional[Callable[[float, float], torch.Tensor]] = None,
+    action_decoder: Optional[ContinousActionDecoder] = None,
+    action_encoder: Optional[Callable[[int], torch.Tensor]] = None,
 ) -> None:
     """Run self-play for as long as needed, only stop if `stop_event` is set to True.
 
@@ -67,7 +79,6 @@ def run_self_play(
         tag: add tag to tensorboard log dir.
     """
 
-    init_absl_logging()
     handle_exit_signal()
     logging.info(f'Start self-play actor {rank}')
 
@@ -79,12 +90,20 @@ def run_self_play(
     for tracker in trackers:
         tracker.reset()
 
+    if isinstance(network_config, MuZeroNet):
+        network = network_config
+    else:
+        network = ContinousMuzeroNet(**network_config)
+
     network = network.to(device=device)
+
+    logging.debug("actor device: ", [p.device for p in network.parameters()])
     network.eval()
     game = 0
 
     while not stop_event.is_set():  # For each new game.
         obs = env.reset()
+        logging.debug(" ================= obs shape: ", obs.shape)
         done = False
         episode_trajectory = []
         steps = 0
@@ -94,24 +113,26 @@ def run_self_play(
         while not done and not stop_event.is_set():
             # Make a copy of current player id.
             player_id = copy.deepcopy(env.current_player)
-            # print(" ================= obs shape: ", obs.shape)
             action, pi_prob, root_value = uct_search(
                 state=obs,
                 network=network,
                 device=device,
                 config=config,
                 temperature=config.visit_softmax_temperature_fn(steps, train_steps_counter.value),
-                actions_mask=env.actions_mask,#None if no_mask else env.actions_mask,
+                actions_mask=None if no_mask else env.actions_mask,
                 current_player=env.current_player,
                 opponent_player=env.opponent_player,
+                action_decoder=action_decoder,
                 action_encoder=action_encoder,
+                step=train_steps_counter.value + steps,
+                distance_projection=use_distance,
             )
             
-            # if action_decoder is not None:
-                # action = action_decoder(action)
-            # print(" ================= action: ", action)
+            logging.debug(f"predicted action: {action}")
+            logging.debug(f"probabilistic choice: {pi_prob.argmax()}")
 
             next_obs, reward, done, _ = env.step(action)
+            logging.debug(" ================= next_obs shape: ", next_obs.shape)
             steps += 1
             action = action if action_encoder is None else action_encoder(action)
             pi_prob = pi_prob if action_encoder is None else action_encoder(pi_prob.argmax()).cpu().numpy()
@@ -119,9 +140,9 @@ def run_self_play(
                 tracker.step(reward, done)
 
             if not isinstance(action, torch.Tensor):
-                print(" ================= action: ", action)
-                print(" ================= type(action): ", type(action))
-                print(" ================= step: ", steps)
+                logging.debug(" ================= action: ", action)
+                logging.debug(" ================= type(action): ", type(action))
+                logging.debug(" ================= step: ", steps)
             episode_trajectory.append((obs, action, reward, pi_prob, root_value, player_id))
             obs = next_obs
 
@@ -132,7 +153,7 @@ def run_self_play(
                 not config.is_board_game
                 and len(episode_trajectory) == config.acc_seq_length + config.unroll_steps + config.td_steps
             ):
-                print("send extra sequence")
+                logging.debug("send extra sequence")
                 # Unpack list of tuples into seperate lists.
                 observations, actions, rewards, pi_probs, root_values, _ = map(list, zip(*episode_trajectory))
                 # Compute n_step target value.
@@ -150,6 +171,8 @@ def run_self_play(
                     priorities[: config.acc_seq_length + config.unroll_steps],
                     config.unroll_steps,
                 ):
+                    # logging.debug(" transition: ", transition)
+                    # logging.debug(" priority: ", priority)
                     data_queue.put((transition, priority))
 
                 del episode_trajectory[: config.acc_seq_length]
@@ -169,8 +192,8 @@ def run_self_play(
 
         priorities = np.abs(np.array(root_values) - np.array(target_values))
 
-        print(" ================= len(episode_trajectory): ", len(episode_trajectory))
-        print(" ================= sending full sequence")
+        logging.debug(" ================= len(episode_trajectory): ", len(episode_trajectory))
+        logging.debug(" ================= sending full sequence")
         # Make unroll sequences and send to learner.
         try:
             for transition, priority in make_unroll_sequence(
@@ -178,8 +201,8 @@ def run_self_play(
             ):
                 data_queue.put((transition, priority))
         except Exception as e:
-            print(" ================= error: ", e)
-            print(" ================= actions: ", actions)
+            logging.debug(" ================= error: ", e)
+            logging.debug(" ================= actions: ", actions)
 
         del episode_trajectory[:]
         del (observations, actions, rewards, pi_probs, root_values, priorities, player_ids, target_values)
@@ -187,11 +210,19 @@ def run_self_play(
     logging.info(f'Stop self-play actor {rank}')
 
 
+def collect_grad_means(model: torch.nn.Module) -> list[Tuple[str, float]]:
+    grads: list[Tuple[str, float]] = []
+    for name, param in model.named_parameters():
+        if param.requires_grad and param.grad is not None and "bias" not in name:
+            mean_grad = param.grad.abs().mean().item()  # Get the mean of the absolute gradient
+            grads.append((name, mean_grad))
+    return grads
+
 def run_training(  # noqa: C901
     config: MuZeroConfig,
     network: MuZeroNet,
-    optimizer: torch.optim.Optimizer,
-    lr_scheduler: torch.optim.lr_scheduler.MultiStepLR,
+    optimizer_state: dict[Any, Any],
+    scheduler_state: dict[Any, Any],
     device: torch.device,
     actor_network: torch.nn.Module,
     replay: PrioritizedReplay,
@@ -236,6 +267,14 @@ def run_training(  # noqa: C901
 
     network = network.to(device=device)
     network.train()
+    optimizer = torch.optim.Adam(network.parameters(), lr=config.lr_init, weight_decay=config.weight_decay)
+    if not (optimizer_state is None):
+        optimizer.load_state_dict(optimizer_state)
+    # lr_scheduler = MultiStepLR(optimizer, milestones=config.lr_milestones, gamma=config.lr_decay_rate)
+    lr_scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=15000, T_mult=1)
+    if not (scheduler_state is None):
+        lr_scheduler.load_state_dict(scheduler_state)
+    # logging.debug("network device: ", network.device)
 
     ckpt_dir = Path(checkpoint_dir)
     if checkpoint_dir is not None and checkpoint_dir != '' and not ckpt_dir.exists():
@@ -248,6 +287,8 @@ def run_training(  # noqa: C901
             'lr_scheduler': lr_scheduler.state_dict(),
             'train_steps': train_steps_counter.value,
         }
+    
+    grads = None
 
     while True:
         if replay.size < config.min_replay_size or replay.size < config.batch_size:
@@ -257,14 +298,19 @@ def run_training(  # noqa: C901
             break
 
         transitions, indices, weights = replay.sample(config.batch_size)
+        # logging.debug(f"Transitions:\n{transitions}")
+        # logging.debug(f"Indices:\n{indices}")
+        # logging.debug(f"Weights:\n{weights}")
         weights = torch.from_numpy(weights).to(device=device, dtype=torch.float32)
 
         optimizer.zero_grad()
         loss, priorities = calc_loss(network, device, transitions, weights)
         loss.backward()
 
-        if config.clip_grad:
-            torch.nn.utils.clip_grad_norm_(network.parameters(), config.max_grad_norm)
+        # if config.clip_grad:
+        #     torch.nn.utils.clip_grad_norm_(network.parameters(), config.max_grad_norm)
+        # grokfast
+        grads = gradfilter_ema(network, grads=grads, alpha=0.98, lamb=2.0)
 
         optimizer.step()
         lr_scheduler.step()
@@ -278,6 +324,9 @@ def run_training(  # noqa: C901
 
         del transitions, indices, weights
 
+        for tracker in trackers:
+            tracker.step(loss.detach().cpu().item(), lr_scheduler.get_last_lr()[0], train_steps_counter.value, network)
+
         if train_steps_counter.value > 1 and train_steps_counter.value % config.checkpoint_interval == 0:
             state_to_save = get_state_to_save()
             ckpt_file = ckpt_dir / f'{ckpt_prefix}_{train_steps_counter.value}'
@@ -287,9 +336,6 @@ def run_training(  # noqa: C901
             actor_network.eval()
 
             del state_to_save
-
-            for tracker in trackers:
-                tracker.step(loss.detach().cpu().item(), lr_scheduler.get_last_lr()[0], train_steps_counter.value)
 
         # Wait for sometime before start training on next batch.
         if config.train_delay is not None and config.train_delay > 0 and train_steps_counter.value > 1:
@@ -343,7 +389,6 @@ def run_board_game_evaluator(
     if not isinstance(env, BoardGameEnv):
         raise ValueError(f'Expect env to be a valid BoardGameEnv instance, got {env}')
 
-    init_absl_logging()
     handle_exit_signal()
     logging.info('Start evaluator')
 
@@ -431,6 +476,7 @@ def run_evaluator(
     tag: str = None,
     num_episodes: int = 1,
     no_mask: bool = False,
+    distance_projection: Optional[Callable[[float, float], torch.Tensor]] = None,
     action_decoder: Optional[Callable] = None,
     action_encoder: Optional[Callable] = None,
 ) -> None:
@@ -451,7 +497,6 @@ def run_evaluator(
 
     """
 
-    init_absl_logging()
     handle_exit_signal()
     logging.info('Start evaluator')
 
@@ -502,6 +547,8 @@ def run_evaluator(
                     opponent_player=env.opponent_player,
                     deterministic=True,
                     action_encoder=action_encoder,
+                    action_decoder=action_decoder,
+                    distance_projection=distance_projection,
                 )
                 
                 if action_decoder is not None:
@@ -519,11 +566,11 @@ def run_evaluator(
 
 
 def run_data_collector(
-    data_queue: multiprocessing.SimpleQueue,
-    replay: PrioritizedReplay,
+    data_queue: multiprocessing.SimpleQueue, #[tuple[Transition, float] | str],
+    replay: PrioritizedReplay[Transition],
     save_frequency: int,
-    save_dir: str,
-    tag: str = None,
+    save_dir: Optional[str],
+    tag: Optional[str] = None,
 ) -> None:
     """Collect samples from self-play,
     this runs on the same process as the training loop,
@@ -545,8 +592,10 @@ def run_data_collector(
     if tag is not None and tag != '':
         samples_prefix = f'{tag}_{samples_prefix}'
 
+    if save_dir is None:
+        raise ValueError("save_dir not provided")
     save_samples_dir = Path(save_dir)
-    if save_dir is not None and save_dir != '' and not save_samples_dir.exists():
+    if save_dir != '' and not save_samples_dir.exists():
         save_samples_dir.mkdir(parents=True, exist_ok=True)
 
     should_save = save_samples_dir.exists() and save_frequency > 0
@@ -556,11 +605,13 @@ def run_data_collector(
             item = data_queue.get()
             if item == 'STOP':
                 break
+            if isinstance(item, str):
+                continue
             transition, priority = item
             replay.add(transition, priority)
             if should_save and replay.num_added > 1 and replay.num_added % save_frequency == 0:
                 save_file = save_samples_dir / f'{samples_prefix}_{replay.size}_{get_time_stamp(True)}'
-                save_to_file(replay.get_state(), save_file)
+                save_to_file(replay.get_state(), str(save_file))
                 logging.info(f"Replay samples saved to '{save_file}'")
         except queue.Empty:
             pass
@@ -577,90 +628,184 @@ def calc_loss(
     """Given a network and batch of transitions, compute the loss for MuZero agent."""
     # [B, state_shape]
     state = torch.from_numpy(transitions.state).to(device=device, dtype=torch.float32, non_blocking=True)
+    # logging.debug(f"state.shape: {state.shape}")
     # [B, T]
     action = torch.from_numpy(transitions.action).to(device=device, dtype=torch.long, non_blocking=True)
     
-    print("action shape in loss: ", action.shape)
-    target_value_scalar = torch.from_numpy(transitions.value).to(device=device, dtype=torch.float32, non_blocking=True)
-    target_reward_scalar = torch.from_numpy(transitions.reward).to(device=device, dtype=torch.float32, non_blocking=True)
+    # logging.debug("action shape in loss: ", action.shape)
+    target_value_scalar = torch.from_numpy(transitions.value).to(device=device, dtype=torch.float32, non_blocking=True).unsqueeze(-1)
+
+    # logging.debug("target_value_scalar shape: ", target_value_scalar.shape)
+    target_reward_scalar = torch.from_numpy(transitions.reward).to(device=device, dtype=torch.float32, non_blocking=True).unsqueeze(-1)
+    
+    # logging.debug("target_reward_scalar shape: ", target_reward_scalar.shape)
     # [B, T, num_actions]
-    target_pi_prob = torch.from_numpy(transitions.pi_prob).to(device=device, dtype=torch.float32, non_blocking=True)
-    print("target_pi_prob shape: ", target_pi_prob.shape)
+    # the vector that was predicted by the policy head of the network
+    target_pi_prob = torch.from_numpy(transitions.pi_prob)
+
+    # assert torch.cdist(network.action_decoder(target_pi_prob.to(device=device)), target_pi_prob).sum() == 0.00001 # check if the action decoder is working correctly
+
+    # selected_action_idx = network.action_decoder.index(target_pi_prob)
+    target_pi_prob = target_pi_prob.to(device=device, dtype=torch.float32, non_blocking=True)
+    # logging.debug("selected_action_idx: ", selected_action_idx)
+    # get every other action in network.action_decoder.action_set
+    # selected_action_idx has size [B, T]
+#     non_targets = []
+# #    logging.debug("not selected", no_select)
+#     for B in range(target_pi_prob.shape[0]):
+#         for i in range(target_pi_prob.shape[1]):
+#             # logging.debug(f"Best match for {network.action_decoder.action_set[B,i]} is {selected_action_idx[B][i]}")
+#             not_selected = network.action_decoder.action_set[~(network.action_decoder.action_set == selected_action_idx[B][i]).all(dim=-1)]
+#             non_targets.append(not_selected)
+
+    # logging.debug("non_targets_shape")
+    
+    # logging.debug("target_pi_prob shape: ", target_pi_prob.shape)
     # Convert scalar targets into transformed support (probabilities).
-    if network.mse_loss_for_value:
-        target_value = target_value_scalar
-    else:
-        # [B, T, num_actions]
-        target_value = scalar_to_categorical_probabilities(target_value_scalar, network.value_support_size)
-    if network.mse_loss_for_reward:
-        target_reward = target_reward_scalar
-    else:
-        # [B, T, num_actions]
-        target_reward = scalar_to_categorical_probabilities(target_reward_scalar, network.reward_support_size)
+    # if network.mse_loss_for_value:
+    #     target_value = target_value_scalar
+    # else:
+    #     # [B, T, num_actions]
+    target_value = scalar_to_categorical_probabilities(target_value_scalar.squeeze(-1), network.value_support_size)
+    logging.debug(f"target_value categorical shape: {target_value.shape}")
+
+    # if network.mse_loss_for_reward:
+    #     target_reward = target_reward_scalar
+    # else:
+    #     # [B, T, num_actions]
+    target_reward = scalar_to_categorical_probabilities(target_reward_scalar.squeeze(-1), network.reward_support_size)
+    logging.debug(f"target_reward categorical shape: {target_reward.shape}")
 
     B, T, V = action.shape
+    # logging.debug("B: ", B)
+    # logging.debug("T: ", T)
+    # logging.debug("V: ", V)
     reward_loss, value_loss, policy_loss = (0, 0, 0)
-    loss_scale = 1.0 / T
+    loss_scale = 1.0 # / T
 
-    lengths = torch.sqrt(torch.sum(action ** 2, axis=-1))
+
+    # target_value = target_value_scalar.unsqueeze(-1).expand(B, T)
+    # target_reward = target_reward_scalar.unsqueeze(-1).expand(B, T)
+    # lengths = torch.sqrt(torch.sum(action ** 2, axis=-1))
 
     # Calculate the regularization term
-    regularization_term = torch.sum((lengths - 1) ** 2)
+    # regularization_term = torch.sum((lengths - 1) ** 2)
 
-    # Define the regularization coefficient
-    lambda_coefficient = 0.1  # This is a hyperparameter that you can tune
+    # # Define the regularization coefficient
+    # lambda_coefficient = 0.1  # This is a hyperparameter that you can tune
 
     pred_values = []
 
     # Get initial hidden state.
     hidden_state = network.represent(state)
+    directional_sensitivity = 10.0
 
     # Unroll K steps.
     for t in range(T):
+        # logging.debug(f"mag hidden_state: {torch.sqrt(torch.sum(hidden_state * hidden_state, dim=-1))}")
         pred_pi_logits, pred_value = network.prediction(hidden_state)
-        print("pred_pi_logits shape: ", pred_pi_logits.shape)
-        print("pred_value shape: ", pred_value.shape)
+        # logging.debug(f"predicted value [{t}]: {pred_value}")
+        # logging.debug("pred_value shape: ", pred_value.shape)
+        # logging.debug("pred_pi_logits shape: ", pred_pi_logits.shape)
+        # logging.debug("pred_value shape: ", pred_value.shape)
         action_slice = action[:, t, :]
-        print("action slice shape: ", action_slice.shape)
+        # logging.debug("action slice shape: ", action_slice.shape)
         hidden_state, pred_reward = network.dynamics(hidden_state, action_slice)
 
+        # logging.debug("=====================================")
         # Scale the gradient for dynamics function by 0.5.
-        hidden_state.register_hook(lambda grad: grad * 0.5)
-
-        value_loss += loss_func(pred_value.squeeze(), target_value[:, t], network.mse_loss_for_value)
-
+        # hidden_state.register_hook(lambda grad: grad * 0.5)
+        # logging.debug("pred_value shape: ", pred_reward.shape)
+        # logging.debug("target_value shape: ", target_value.shape)
+        # logging.debug(" Value net: ")
+        t_v = target_value[:, t]
+        # logging.debug("t_v shape: ", t_v.shape)
+        # logging.debug("t_v: ", t_v)
+        value_loss += loss_func(pred_value.squeeze(), t_v, mse=True, cosine=False) * T
+        # logging.debug("value_loss: ", value_loss)
+        
         # Shouldn't we exclude the reward loss for board games as stated in the paper?
-        reward_loss += loss_func(pred_reward.squeeze(), target_reward[:, t], network.mse_loss_for_reward)
+        # logging.debug("pred_reward shape: ", pred_reward.shape)
+        # logging.debug("target_reward shape: ", target_reward.shape)
+        # logging.debug(" Reward net: ")
+        t_r = target_reward[:, t]
+        # logging.debug("t_r shape: ", t_r.shape)
+        # logging.debug("t_r: ", t_r)
+        reward_loss += loss_func(pred_reward.squeeze(), t_r, mse=True, cosine=False) * T
+        # logging.debug("reward_loss: ", reward_loss)
+
+        # logging.debug("pred_pi_logits shape: ", pred_pi_logits.shape)
+        # logging.debug("target_pi_prob shape: ", target_pi_prob.shape)
+        # logging.debug(" Policy net: ")
+        # TODO: in case of continous~categorical (classical control)
+        #       we need a way to steer output intensity (maybe vector magnitude) 
         policy_loss += loss_func(pred_pi_logits, target_pi_prob[:, t])
+        # policy_loss += margin_cosine_embedding_loss(pred_pi_logits, target_pi_prob[:, t], non_targets=non_targets)
+        # logging.debug("policy_loss: ", policy_loss)
+        # logging.debug("=====================================")
 
         pred_values.append(pred_value.detach())
 
-    loss = reward_loss + value_loss + policy_loss + lambda_coefficient * regularization_term
+    # logging.debug("reward_loss sum(): ", reward_loss.sum())
+    # logging.debug("value_loss sum(): ", value_loss.sum())
+    # logging.debug("policy_loss sum(): ", policy_loss.sum())
+
+    loss = reward_loss + value_loss + policy_loss # + lambda_coefficient * regularization_term
+    # logging.debug("loss shape: ", loss.shape)
+    # logging.debug("weights shape: ", weights.shape)
 
     # Scale loss using importance sampling weights, then average over batch dimension B.
-    loss = torch.mean(loss * weights.detach())
-    print("loss: ", loss)
+    loss = torch.mean(loss.to(device) * weights.detach().to(device).unsqueeze(-1))
+    # logging.debug("loss: ", loss)
 
     # Scale the loss by 1/unroll_steps.
-    loss.register_hook(lambda grad: grad * loss_scale)
+    # loss.register_hook(lambda grad: grad * loss_scale)
 
     # Using the delta between predicted values and target values as priorities.
     with torch.no_grad():
         pred_values = torch.stack(pred_values, dim=1)
-        if network.mse_loss_for_value:
-            pred_values_scalar = pred_values.squeeze(-1)
-        else:
-            pred_values_scalar = logits_to_transformed_expected_value(pred_values, network.value_support_size).squeeze(-1)
-        priorities = (pred_values_scalar[:, 0] - target_value_scalar[:, 0]).abs().cpu().numpy()
-        # priorities = torch.mean(pred_values_scalar - target_value_scalar, dim=-1).abs().cpu().numpy()
+        # logging.debug("pred_values shape: ", pred_values.shape)
+        # logging.debug("network.mse_loss_for_value: ", network.mse_loss_for_value)
+        # if network.mse_loss_for_value:
+        #     pred_values_scalar = pred_values.squeeze(-1)
+        # else:
+        pred_values_scalar = logits_to_transformed_expected_value(pred_values, network.value_support_size).squeeze(-1)
+        
+        # logging.debug("pred_values_scalar shape: ", pred_values_scalar.shape)
+        # logging.debug("target_value shape: ", target_value.shape)
+        priorities = (pred_values_scalar - target_value_scalar.squeeze(-1)).abs().cpu().numpy()
+        priorities = torch.mean(pred_values_scalar - target_value_scalar.squeeze(-1), dim=-1).abs().cpu().numpy()
+        # logging.debug("priorities: ", priorities)
 
     return loss, priorities
 
+def margin_cosine_embedding_loss(prediction: torch.Tensor, target: torch.Tensor, non_targets: torch.Tensor, margin: float = 0.1):
+    # Normalize the embeddings to prevent scale issues affecting the cosine distance
+    prediction_norm = F.normalize(prediction, p=2, dim=1)
+    target_norm = F.normalize(target, p=2, dim=1)
+    non_targets_norm = F.normalize(non_targets, p=2, dim=-1)
 
-def loss_func(prediction: torch.Tensor, target: torch.Tensor, mse: bool = False) -> torch.Tensor:
+    # Calculate the cosine similarity between predictions and targets
+    cosine_similarity = (prediction_norm * target_norm).sum(dim=1)
+
+    # Calculate the positive part of the loss (distance from the correct targets)
+    positive_loss = 1 - cosine_similarity
+
+    # Calculate the negative part of the loss (push away from incorrect targets by a margin)
+    # Compute cosine similarities between each prediction and all its non-targets
+    negative_cosine_sim = torch.bmm(non_targets_norm, prediction_norm.unsqueeze(-1)).squeeze(-1)
+
+    # Apply the margin and ReLU to ensure only positive contributions to the loss
+    negative_loss = F.relu(negative_cosine_sim + margin - cosine_similarity.unsqueeze(1)).mean(dim=1)
+
+    # The final loss is a sum of the positive loss and the average negative loss
+    total_loss = positive_loss.mean() + negative_loss.mean()
+    return total_loss
+
+def loss_func(prediction: torch.Tensor, target: torch.Tensor, mse: bool = False, cosine: bool = True) -> torch.Tensor:
     """Loss function for MuZero agent's value and reward."""
-    print("prediction shape: ", prediction.shape)
-    print("target shape: ", target.shape)
+    # logging.debug("prediction: ", prediction)
+    # logging.debug("target: ", target)
     assert prediction.shape == target.shape
 
     if not mse:
@@ -670,6 +815,17 @@ def loss_func(prediction: torch.Tensor, target: torch.Tensor, mse: bool = False)
         # [B]
         # return 0.5 * torch.square((prediction - target))
         return F.mse_loss(prediction, target, reduction='none')
+
+    if cosine:
+        if prediction.isnan().any():
+            logging.debug("prediction: ", prediction)
+        if target.isnan().any():
+            logging.debug("target: ", target)
+        # logging.debug("target length: ", torch.sqrt(torch.sum(target ** 2, axis=-1)))
+        # logging.debug("prediction length: ", torch.sqrt(torch.sum(prediction ** 2, axis=-1)))
+        l = F.cosine_embedding_loss(prediction, target, torch.ones(target.shape[0], device=prediction.device))
+        # logging.debug("cosine loss: ", l)
+        return l
 
     # [B]
     # return torch.sum(-target * F.log_softmax(prediction, dim=1), dim=1)
@@ -873,13 +1029,6 @@ def _make_unroll_sequence(
             ),
             priorities[t],
         )
-
-
-def init_absl_logging():
-    """Initialize absl.logging when run the process without app.run()"""
-    logging._warn_preinit_stderr = 0  # pylint: disable=protected-access
-    logging.set_verbosity(logging.INFO)
-    logging.use_absl_handler()
 
 
 def handle_exit_signal():

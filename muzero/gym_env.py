@@ -15,6 +15,7 @@
 """gym environment processing components."""
 
 # Temporally suppress annoy DeprecationWarning from gym.
+from typing import TypeVar
 import warnings
 
 warnings.filterwarnings('ignore', category=DeprecationWarning)
@@ -504,11 +505,15 @@ def create_atari_environment(
     return env
 
 
+O = TypeVar('O')
+A = TypeVar('A')
+
 def create_classic_environment(
     env_name: str,
     seed: int = 1,
     stack_history: int = 1,
-) -> gym.Env:
+    output_actions: bool = False,
+) -> gym.Env[O, A] | tuple[gym.Env[O, A], list[str]]:
     """
     Process gym env for classic games like CartPole, LunarLander, MountainCar
 
@@ -527,10 +532,17 @@ def create_classic_environment(
         env = StackFrameAndAction(env, stack_history, False)
 
     env = PlayerIdAndActionMaskWrapper(env)
+    if output_actions:
+        if env_name == 'CartPole-v1':
+            return env, ['MOVE: left', 'MOVE: right']
+        if env_name == 'LunarLander-v2':
+            return env, ['NOOP', 'FIRE', 'MOVE: right', 'MOVE: left']
+        return env
+        # return env, env.unwrapped.get_action_meanings()
     return env
 
 
-def record_video_env(env: gym.Env, save_dir: str = 'recordings') -> gym.Env:
+def record_video_env(env: gym.Env[O, A], save_dir: str = 'recordings') -> gym.Env[O, A]:
     """Returns a env with gym.wrappers.RecordVideo wrapped."""
     ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
     full_path = f'{save_dir}/{env.spec.id}_{ts}'

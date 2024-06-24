@@ -14,12 +14,16 @@
 # ==============================================================================
 import warnings
 
+import torch
+
+from muzero.continous.debug import plot_grad_flow
+
 warnings.filterwarnings('ignore', category=DeprecationWarning)
 
 from pathlib import Path
 import shutil
 import timeit
-from typing import Mapping, Text, List
+from typing import Mapping, Optional, Text, List
 import numpy as np
 
 from torch.utils.tensorboard import SummaryWriter
@@ -106,7 +110,7 @@ class LearnerTracker:
         self._num_steps_since_reset = 0
         self._start = timeit.default_timer()
 
-    def step(self, loss, lr, train_steps) -> None:
+    def step(self, loss, lr, train_steps, model: Optional[torch.nn.Module]) -> None:
         """Log training loss statistics."""
         self._num_steps_since_reset = train_steps
 
@@ -115,7 +119,9 @@ class LearnerTracker:
 
         time_stats = self.get_time_stat()
         self._writer.add_scalar('learner(train_steps)/step_rate(minutes)', time_stats['step_rate'] * 60, train_steps)
-        # self._writer.add_scalar('learner(train_steps)/run_duration(minutes)', time_stats['duration'] / 60, train_steps)
+        if model is not None:
+            img = plot_grad_flow(model, as_image=True)
+            self._writer.add_image('learner(train_steps)/grad_flow', img.squeeze(0), train_steps)
 
     def get_time_stat(self) -> Mapping[Text, float]:
         """Returns statistics as a dictionary."""

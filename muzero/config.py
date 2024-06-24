@@ -127,7 +127,7 @@ def make_tictactoe_config(
         num_res_blocks=0 if use_mlp_net else 2,
         hidden_dim=64 if use_mlp_net else 0,
         min_replay_size=min_replay_size,
-        checkpoint_interval=500,
+        checkpoint_interval=100,
         acc_seq_length=9999,
         train_delay=0.0,
         clip_grad=clip_grad,
@@ -219,7 +219,7 @@ def make_atari_config(
         lr_milestones=[100e3, 200e3],
         visit_softmax_temperature_fn=atari_visit_softmax_temperature_fn,
         num_training_steps=num_training_steps,
-        num_planes=512, # 256
+        num_planes= 256, # ,512
         num_res_blocks=8,  # 16
         hidden_dim=0,
         value_support_size=61,  # 601

@@ -21,7 +21,6 @@ import multiprocessing
 import threading
 import numpy as np
 import torch
-from torch.optim.lr_scheduler import MultiStepLR
 
 from muzero.network import MuZeroAtariNet
 from muzero.continous import ContinousActionDecoder, ContinousActionEncoder, ContinousMuzeroNet, VitConfig, tokenizer
@@ -31,25 +30,25 @@ from muzero.gym_env import create_atari_environment
 from muzero.pipeline import run_self_play, run_training, run_data_collector, run_evaluator, load_checkpoint, load_from_file
 
 FLAGS = flags.FLAGS
-flags.DEFINE_string('environment_name', 'Pong', 'Classic problem like Breakout, Pong')
+flags.DEFINE_string('environment_name', 'Breakout', 'Classic problem like Breakout, Pong etc.')
 flags.DEFINE_integer('environment_height', 224, 'Environment frame screen height.')
 flags.DEFINE_integer('environment_width', 224, 'Environment frame screen width.')
 flags.DEFINE_integer('environment_frame_skip', 4, 'Number of frames to skip.')
-flags.DEFINE_integer('environment_frame_stack', 8, 'Number of frames to stack.')
+flags.DEFINE_integer('environment_frame_stack', 16, 'Number of frames to stack.')
 flags.DEFINE_integer('max_episode_steps', 108000, 'Maximum steps (before frame skip) per episode.')
 flags.DEFINE_bool('gray_scale', False, 'Gray scale observation image.')
 flags.DEFINE_bool('clip_reward', True, 'Clip reward in the range [-1, 1], default on.')
 flags.DEFINE_bool('done_on_life_loss', True, 'End of game if loss a life, default on.')
-flags.DEFINE_integer('num_actors', 1, 'Number of self-play actor processes.')
+flags.DEFINE_integer('num_actors', 4, 'Number of self-play actor processes.')
 
 flags.DEFINE_integer('num_training_steps', int(10e6), 'Number of traning steps.')
-flags.DEFINE_integer('batch_size', 128, 'Batch size for traning.')
+flags.DEFINE_integer('batch_size', 128, 'Batch size for training.')
 flags.DEFINE_integer('replay_capacity', int(1e6), 'Maximum replay size.')
 flags.DEFINE_integer('min_replay_size', 1000, 'Minimum replay size before start to do traning.')
 flags.DEFINE_float(
-    'priority_exponent', 0.0, 'Priotiry exponent used in prioritized replay, 0 means using uniform random replay.'
+    'priority_exponent', 1.0, 'Priotiry exponent used in prioritized replay, 0 means using uniform random replay.'
 )
-flags.DEFINE_float('importance_sampling_exponent', 0.0, 'Importance sampling exponent value.')
+flags.DEFINE_float('importance_sampling_exponent', 1.0, 'Importance sampling exponent value.')
 
 flags.DEFINE_integer('seed', 1, 'Seed the runtime.')
 flags.DEFINE_bool('use_tensorboard', True, 'Monitor performance with Tensorboard, default on.')
@@ -58,7 +57,8 @@ flags.DEFINE_bool('clip_grad', True, 'Clip gradient, default off.')
 flags.DEFINE_string('checkpoint_dir', 'checkpoints', 'Path for save checkpoint files.')
 flags.DEFINE_string(
     'load_checkpoint_file',
-    '',
+    'checkpoints/BreakoutNoFrameskip-v4_train_steps_1000',
+    # '',
     'Load the checkpoint from file.',
 )
 
@@ -86,7 +86,8 @@ def main(argv):
     """Trains MuZero agent on Atari games."""
     del argv
 
-    runtime_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # runtime_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    runtime_device = torch.device('mps')
     random_state = np.random.RandomState(FLAGS.seed)  # pylint: disable=no-member
     torch.manual_seed(FLAGS.seed)
     if torch.backends.cudnn.enabled:
@@ -131,52 +132,73 @@ def main(argv):
     formatted_actions = [f"action: {action}" for action in eval_actions]
     print(f"formatted actions: {formatted_actions}")
     
-    tokenized_actions = tokenizer(formatted_actions, padding=True, return_tensors="pt").to(runtime_device)
+    # huggingface tokenizer
+    # tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+    # tokenized_actions = tokenizer(formatted_actions, padding=True, return_tensors="pt")
+    tokenized_actions = tokenizer(formatted_actions)
+
     # print(f"tokenized actions: {tokenized_actions}")
     action_encoder = ContinousActionEncoder()
-    action_embeddings = action_encoder(tokenized_actions.input_ids, tokenized_actions.attention_mask)
+    action_embeddings = action_encoder(tokenized_actions, None)
 
     print("action embeddings shape: ", action_embeddings.shape)
     
-    action_decoder = ContinousActionDecoder(action_embeddings)
+    action_decoder = ContinousActionDecoder(action_embeddings.clone())
 
     network = ContinousMuzeroNet(
         action_encoder,
         action_decoder,
         action_embeddings.shape[-1],
         VitConfig(),
+        512,
         config.num_planes,
         config.value_support_size,
         config.reward_support_size,
         FLAGS.environment_frame_stack,
         8, # attention heads
     )
-    optimizer = torch.optim.Adam(network.parameters(), lr=config.lr_init, weight_decay=config.weight_decay)
-    lr_scheduler = MultiStepLR(optimizer, milestones=config.lr_milestones, gamma=config.lr_decay_rate)
 
+    action_decoder = ContinousActionDecoder(action_embeddings.clone())
     actor_network = ContinousMuzeroNet(
         action_encoder,
         action_decoder,
         action_embeddings.shape[-1],
         VitConfig(),
+        512,
         config.num_planes,
         config.value_support_size,
         config.reward_support_size,
         FLAGS.environment_frame_stack,
         8, # attention heads
     )
+    
+    action_decoder = ContinousActionDecoder(action_embeddings.clone())
     actor_network.share_memory()
+
     new_ckpt_network = ContinousMuzeroNet(
         action_encoder,
         action_decoder,
         action_embeddings.shape[-1],
         VitConfig(),
+        512,
         config.num_planes,
         config.value_support_size,
         config.reward_support_size,
         FLAGS.environment_frame_stack,
         8, # attention heads
     )
+
+    # list devices that the networks are on
+    # print(f"network device: {[p.device for p in network.parameters()]}")
+    # print(f"actor network device: {[p.device for p in actor_network.parameters()]}")
+    # print(f"new ckpt network device: {[p.device for p in new_ckpt_network.parameters()]}")
+
+    # print(f"encoder device net: {network.action_encoder.action_encoder.device}")
+    # print(f"encoder device action: {actor_network.action_encoder.action_encoder.device}")
+    # print(f"encoder device new_ckpt: {new_ckpt_network.action_encoder.action_encoder.device}")
+    # print(f"decoder device net: {[t.device for t in network.action_decoder.action_set]}")
+    # print(f"decoder device action: {[t.device for t in actor_network.action_decoder.action_set]}")
+    # print(f"decoder device new_ckpt: {[t.device for t in new_ckpt_network.action_decoder.action_set]}")
 
     replay = PrioritizedReplay(
         FLAGS.replay_capacity,
@@ -200,14 +222,18 @@ def main(argv):
     if FLAGS.load_checkpoint_file is not None and os.path.isfile(FLAGS.load_checkpoint_file):
         loaded_state = load_checkpoint(FLAGS.load_checkpoint_file, 'cpu')
         network.load_state_dict(loaded_state['network'])
-        optimizer.load_state_dict(loaded_state['optimizer'])
-        lr_scheduler.load_state_dict(loaded_state['lr_scheduler'])
+        optimizer_state = loaded_state['optimizer']
+        scheduler_state = loaded_state['lr_scheduler']
         train_steps_counter.value = loaded_state['train_steps']
 
         actor_network.load_state_dict(loaded_state['network'])
 
         logging.info(f'Loaded state from checkpoint {FLAGS.load_checkpoint_file}')
-        logging.info(f'Current state: train steps {train_steps_counter.value}, learing rate {lr_scheduler.get_last_lr()}')
+        logging.info(f'Current state: train steps {train_steps_counter.value}, learing rate {scheduler_state.get("last_lr")}')
+    else:
+        logging.warn(f"could not load checkpoint file {FLAGS.load_checkpoint_file}")
+        optimizer_state = None
+        scheduler_state = None
 
     # Load replay samples
     if FLAGS.load_samples_file is not None and os.path.isfile(FLAGS.load_samples_file):
@@ -232,8 +258,8 @@ def main(argv):
         args=(
             config,
             network,
-            optimizer,
-            lr_scheduler,
+            optimizer_state,
+            scheduler_state,
             runtime_device,
             actor_network,
             replay,
@@ -247,7 +273,7 @@ def main(argv):
     )
     learner.start()
     
-    action_encoder = ActionEncoderWith(action_embeddings)
+    action_encoder = ActionEncoderWith(action_embeddings.clone())
 
     # Start evaluation loop on a seperate process.
     evaluator = multiprocessing.Process(
@@ -271,12 +297,24 @@ def main(argv):
     # # Start self-play processes.
     actors = []
     for i in range(FLAGS.num_actors):
+        action_decoder = ContinousActionDecoder(action_embeddings.clone())
+        net_config = {
+            "action_encoder": ContinousActionEncoder(),
+            "action_decoder": action_decoder,
+            "action_space_dim": action_embeddings.shape[-1],
+            "vit_config": VitConfig(),
+            "num_planes": config.num_planes,
+            "value_support_size": config.value_support_size,
+            "reward_support_size": config.reward_support_size,
+            "sequence_length": FLAGS.environment_frame_stack,
+            "attention_heads": 8, # attention heads
+        }
         actor = multiprocessing.Process(
             target=run_self_play,
             args=(
                 config,
                 i,
-                actor_network,
+                net_config,
                 runtime_device,
                 self_play_envs[i],
                 data_queue,

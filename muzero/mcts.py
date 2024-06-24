@@ -17,12 +17,14 @@
 from __future__ import annotations
 
 import collections
+import logging
 import math
 import copy
-from typing import List, Tuple, Optional
+from typing import Callable, List, Tuple, Optional
 import numpy as np
 import torch
 
+from muzero.continous.io import ContinousActionDecoder
 from muzero.network import MuZeroNet
 from muzero.config import MuZeroConfig, KnownBounds
 
@@ -122,7 +124,13 @@ class Node:
         ucb_results = self.child_Q(min_max_stats, config) + self.child_U(config)
 
         # Break ties when have multiple 'max' value.
+        # print(f"ucb results: {np.where(ucb_results == ucb_results.max())[0]}")
+        # if len(np.where(ucb_results == ucb_results.max())[0]) > 1:
         action_index = np.random.choice(np.where(ucb_results == ucb_results.max())[0])
+        # else:
+        #     print("Weird issue happened")
+        #     print("ucb results: ", ucb_results)
+        action_index = np.argmax(ucb_results)
         best_child = self.children[action_index]
 
         return best_child
@@ -218,7 +226,7 @@ class Node:
         return isinstance(self.parent, Node)
 
 
-def add_dirichlet_noise(prob: np.ndarray, eps: float = 0.25, alpha: float = 0.03):
+def add_dirichlet_noise(prob: np.ndarray, eps: float = 0.25, alpha: float = 0.03) -> np.ndarray:
     """Add dirichlet noise to a given probabilities.
     Args:
         prob: a numpy.array contains action probabilities we want to add noise to.
@@ -246,6 +254,30 @@ def add_dirichlet_noise(prob: np.ndarray, eps: float = 0.25, alpha: float = 0.03
     noise = np.random.dirichlet(alphas)
     noised_prob = (1 - eps) * prob + eps * noise
     return noised_prob
+
+
+def add_gaussian_noise(value: np.ndarray, sigma: float = 0.03) -> np.ndarray:
+    """Add gaussian noise to a given value.
+    Args:
+        value: a numpy.array contains value we want to add noise to.
+        sigma: standard deviation of the gaussian noise.
+
+    Returns:
+        value with added gaussian noise.
+
+    Raises:
+        ValueError:
+            if input argument `value` is not a valid float numpy.array.
+            if input argument `sigma` is not float type.
+    """
+
+    if not isinstance(value, np.ndarray) or value.dtype not in (np.float32, np.float64):
+        raise ValueError(f"Expect `value` to be a numpy.array, got {value}")
+    if not isinstance(sigma, float):
+        raise ValueError(f"Expect `sigma` to be float type, got {sigma}")
+
+    noise = np.random.normal(0, sigma, value.shape)
+    return value + noise
 
 
 def generate_play_policy(visits_count: np.ndarray, temperature: float) -> np.ndarray:
@@ -291,13 +323,38 @@ def set_illegal_action_probs_to_zero(actions_mask: np.ndarray, prob: np.ndarray)
         a 1D float numpy.array prior/action probabilities with invalid actions masked out.
     """
 
-    assert actions_mask.shape == prob.shape
+    assert actions_mask.shape == prob.shape, f'actions_mask: {actions_mask.shape}, prob: {prob.shape}'
 
     prob = np.where(actions_mask, prob, 0.0)
     sumed = np.sum(prob)
     if sumed > 0:
         prob /= sumed
     return prob
+
+def normalized_gaussian(i: int, l: int, phi: float):
+    # Generate an array of indices
+    print(f"i: {i}, l: {l}, phi: {phi}")
+    x = np.arange(l)
+    eps = 1e-8
+    # Calculate the Gaussian function
+    gaussian = np.exp(-0.5 * ((x - i) / (phi + eps)) ** 2)
+    # Normalize the Gaussian to sum to 1
+    normalized_gaussian = gaussian / np.sum(gaussian)
+    return normalized_gaussian
+
+
+def normalized_uniform(i: int, l: int, temp: float) -> torch.Tensor:
+    scales = torch.ones(l) * temp
+    scales[i] = 1
+    random_sample = torch.rand(l) * math.log(2.71828 * temp + 1) + (1 - temp)
+    scaled_sample = random_sample * scales
+    normalized_sample = scaled_sample / torch.sum(scaled_sample)
+    return normalized_sample
+
+
+def continous_annealing(step: int):
+    total_steps = 1e6
+    return math.exp(-0.5 * math.log(total_steps) * step / total_steps)
 
 
 def uct_search(
@@ -310,7 +367,10 @@ def uct_search(
     current_player: int,
     opponent_player: int,
     deterministic: bool = False,
-    action_encoder: Optional[callable] = None,
+    action_decoder: Optional[ContinousActionDecoder] = None,
+    action_encoder: Optional[Callable[[int], torch.Tensor]] = None, # f (int) -> torch.tensor
+    step: int = 0,
+    distance_projection: Optional[Callable[[float, float], torch.Tensor]] = None, # function that maps a discrete action and the predicted distance from that action to a probability distribution over actions 
 ) -> Tuple[int, np.ndarray, float]:
     """Single-threaded Upper Confidence Bound (UCB) for Trees (UCT) search without any rollout.
 
@@ -359,13 +419,37 @@ def uct_search(
     prior_prob = network_output.pi_probs
     root_node = Node(prior=0.0)
     
-    if action_encoder is not None:
-        # print(f"encoder actions: {len(action_encoder.get_action_embeddings())}; prior: {prior_prob.shape}, mask: {actions_mask.shape}")
-        prior_prob = np.ones(actions_mask.shape, dtype=np.float32)
+    if action_decoder is not None:
+        if distance_projection is not None:
+            index, distance = action_decoder.index(torch.tensor(prior_prob).unsqueeze(0), return_dist=True)
+            prior_prob = distance_projection(index.item(), distance.item())
+        else:
+            selected_action_index = action_decoder.index(torch.tensor(prior_prob).unsqueeze(0)).squeeze().item()
+            # print(f"actions mask: {actions_mask}")
+            # prior_prob = np.zeros(len(actions_mask), dtype=np.float32)
+            # prior_prob[selected_action_index] = 1.0
+            # prior_prob = normalized_gaussian(selected_action_index, len(actions_mask), temperature)
+            annealing_temp = continous_annealing(step)
+            prior_prob = normalized_uniform(selected_action_index, len(actions_mask), annealing_temp)
+            if (step % 100 == 0):
+                logging.debug(f" ======== Step {step} ======== ")
+                logging.debug(f"selected action index: {selected_action_index}")
+                logging.debug(f"temperature: {temperature}")
+                logging.debug(f"annealing temp: {annealing_temp}")
+                logging.debug(f"prior prob discretized: {prior_prob}")
+
+    #     # print(f"encoder actions: {len(action_encoder.get_action_embeddings())}; prior: {prior_prob.shape}, mask: {actions_mask.shape}")
+    #     prior_prob = np.ones(actions_mask.shape, dtype=np.float32)
     
     # Add dirichlet noise to the prior probabilities to root node.
-    if not deterministic and config.root_dirichlet_alpha > 0.0 and config.root_exploration_eps > 0.0:
-        prior_prob = add_dirichlet_noise(prior_prob, eps=config.root_exploration_eps, alpha=config.root_dirichlet_alpha)
+    if not deterministic and distance_projection is None and config.root_dirichlet_alpha > 0.0 and config.root_exploration_eps > 0.0:
+        prior_prob = add_dirichlet_noise(prior_prob.numpy(), eps=config.root_exploration_eps, alpha=config.root_dirichlet_alpha)
+    else:
+        prior_prob = prior_prob.numpy()
+
+    if (step % 100 == 0):
+        logging.info(f"prior prob: {prior_prob}")
+    # if distance_projection:
     # Set prior probabilities to zero for illegal actions.
     if actions_mask is not None:
         prior_prob = set_illegal_action_probs_to_zero(actions_mask, prior_prob)
@@ -388,10 +472,12 @@ def uct_search(
         # Phase 2 - Expand and evaluation
         hidden_state = torch.from_numpy(node.parent.hidden_state).to(device=device, dtype=torch.float32)
         if action_encoder is not None:
-            action = action_encoder(node.move)
+            action_vec = action_encoder(node.move)
+            # print(f"action vec: {action_vec[0:10]}")
+            network_output = network.recurrent_inference(hidden_state[None, ...], action_vec[None, ...])
         else:
             action = torch.tensor([node.move], dtype=torch.long, device=device)
-        network_output = network.recurrent_inference(hidden_state[None, ...], action[None, ...])
+            network_output = network.recurrent_inference(hidden_state[None, ...], action[None, ...])
 
         node.expand(prior_prob, curr_player, network_output.hidden_state, network_output.reward)
 

@@ -38,7 +38,7 @@ from muzero.grokfast import gradfilter_ema
 from muzero.network import MuZeroNet
 from muzero.replay import Transition, PrioritizedReplay
 from muzero.trackers import make_actor_trackers, make_learner_trackers, make_evaluator_trackers
-from muzero.mcts import uct_search
+from muzero.mcts import continous_annealing, uct_search
 from muzero.util import scalar_to_categorical_probabilities, logits_to_transformed_expected_value
 from muzero.rating import compute_elo_rating
 from muzero.continous.io import ContinousActionDecoder
@@ -128,7 +128,7 @@ def run_self_play(
                 distance_projection=use_distance,
             )
             
-            logging.debug(f"predicted action: {action}")
+            logging.info(f"predicted action: {action}")
             logging.debug(f"probabilistic choice: {pi_prob.argmax()}")
 
             next_obs, reward, done, _ = env.step(action)
@@ -137,7 +137,7 @@ def run_self_play(
             action = action if action_encoder is None else action_encoder(action)
             pi_prob = pi_prob if action_encoder is None else action_encoder(pi_prob.argmax()).cpu().numpy()
             for tracker in trackers:
-                tracker.step(reward, done)
+                tracker.step(reward, done, continous_annealing(train_steps_counter.value + steps))
 
             if not isinstance(action, torch.Tensor):
                 logging.debug(" ================= action: ", action)
@@ -267,13 +267,22 @@ def run_training(  # noqa: C901
 
     network = network.to(device=device)
     network.train()
-    optimizer = torch.optim.Adam(network.parameters(), lr=config.lr_init, weight_decay=config.weight_decay)
-    if not (optimizer_state is None):
-        optimizer.load_state_dict(optimizer_state)
+    # support legacy configurations
+    if isinstance(optimizer_state, torch.optim.Adam):
+        optimizer = optimizer_state
+    else:
+        optimizer = torch.optim.Adam(network.parameters(), lr=config.lr_init, weight_decay=config.weight_decay)
+        if not (optimizer_state is None):
+            optimizer.load_state_dict(optimizer_state)
+
     # lr_scheduler = MultiStepLR(optimizer, milestones=config.lr_milestones, gamma=config.lr_decay_rate)
-    lr_scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=15000, T_mult=1)
-    if not (scheduler_state is None):
-        lr_scheduler.load_state_dict(scheduler_state)
+    # support legacy configurations
+    if (not scheduler_state is None) and not isinstance(scheduler_state, dict):
+        lr_scheduler = scheduler_state
+    else:
+        lr_scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=5000, T_mult=1)
+        if not (scheduler_state is None):
+            lr_scheduler.load_state_dict(scheduler_state)
     # logging.debug("network device: ", network.device)
 
     ckpt_dir = Path(checkpoint_dir)
@@ -325,7 +334,7 @@ def run_training(  # noqa: C901
         del transitions, indices, weights
 
         for tracker in trackers:
-            tracker.step(loss.detach().cpu().item(), lr_scheduler.get_last_lr()[0], train_steps_counter.value, network)
+            tracker.step(loss.detach().cpu().item(), lr_scheduler.get_last_lr()[0], train_steps_counter.value, network, continous_annealing(train_steps_counter.value))
 
         if train_steps_counter.value > 1 and train_steps_counter.value % config.checkpoint_interval == 0:
             state_to_save = get_state_to_save()
@@ -551,8 +560,7 @@ def run_evaluator(
                     distance_projection=distance_projection,
                 )
                 
-                if action_decoder is not None:
-                    action = action_decoder(action)
+                action = action if action_decoder is not None else action_decoder(action)
 
                 obs, reward, done, _ = env.step(action)
                 steps += 1

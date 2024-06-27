@@ -52,7 +52,7 @@ class ActorTracker:
 
         self._start = timeit.default_timer()
 
-    def step(self, reward, done) -> None:
+    def step(self, reward, done, annealing_temp: float = 0.0) -> None:
         """Accumulate episode rewards and steps statistics."""
         self._current_episode_rewards.append(reward)
 
@@ -78,6 +78,7 @@ class ActorTracker:
             self._writer.add_scalar('actor(env_steps)/num_episodes', num_episodes, tb_steps)
             self._writer.add_scalar('actor(env_steps)/episode_return', episode_return, tb_steps)
             self._writer.add_scalar('actor(env_steps)/episode_steps', episode_step, tb_steps)
+            self._writer.add_scalar('actor(env_steps)/annealing_temp', annealing_temp, tb_steps)
 
             time_stats = self.get_time_stat()
             # self._writer.add_scalar('actor(env_steps)/run_duration(minutes)', time_stats['duration'] / 60, tb_steps)
@@ -110,12 +111,13 @@ class LearnerTracker:
         self._num_steps_since_reset = 0
         self._start = timeit.default_timer()
 
-    def step(self, loss, lr, train_steps, model: Optional[torch.nn.Module]) -> None:
+    def step(self, loss: float, lr: float, train_steps: int, model: Optional[torch.nn.Module], annealing_temp: float = 0.0) -> None:
         """Log training loss statistics."""
         self._num_steps_since_reset = train_steps
 
         self._writer.add_scalar('learner(train_steps)/loss', loss, train_steps)
         self._writer.add_scalar('learner(train_steps)/learning_rate', lr, train_steps)
+        self._writer.add_scalar('learner(train_steps)/annealing_temp', annealing_temp, train_steps)
 
         time_stats = self.get_time_stat()
         self._writer.add_scalar('learner(train_steps)/step_rate(minutes)', time_stats['step_rate'] * 60, train_steps)

@@ -200,6 +200,39 @@ def make_classic_config(
         is_board_game=False,
     )
 
+def make_continous_control_config(
+    num_training_steps: int = 100000,
+    batch_size: int = 256,
+    min_replay_size: int = 10000,
+    use_tensorboard: bool = True,
+    clip_grad: bool = False,
+) -> MuZeroConfig:
+    """Returns MuZero config for openAI Gym classic control games."""
+
+    return MuZeroConfig(
+        discount=0.997,
+        dirichlet_alpha=0.25,
+        num_simulations=50,
+        batch_size=batch_size,
+        td_steps=10,
+        lr_init=0.05,
+        lr_milestones=[20000],
+        visit_softmax_temperature_fn=classic_visit_softmax_temperature_fn,
+        num_training_steps=num_training_steps,
+        num_planes=512,
+        num_res_blocks=0,  # using MLP net
+        hidden_dim=64,
+        value_support_size=31,  # in the range [-15, 15]
+        reward_support_size=31,  # in the range [-15, 15]
+        min_replay_size=min_replay_size,
+        checkpoint_interval=200,
+        acc_seq_length=9999,
+        train_delay=0.0,
+        clip_grad=clip_grad,
+        use_tensorboard=use_tensorboard,
+        is_board_game=False,
+    )
+
 
 def make_atari_config(
     num_training_steps: int = int(10e6),

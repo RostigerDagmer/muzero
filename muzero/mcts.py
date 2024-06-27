@@ -331,6 +331,7 @@ def set_illegal_action_probs_to_zero(actions_mask: np.ndarray, prob: np.ndarray)
         prob /= sumed
     return prob
 
+
 def normalized_gaussian(i: int, l: int, phi: float):
     # Generate an array of indices
     print(f"i: {i}, l: {l}, phi: {phi}")
@@ -353,7 +354,7 @@ def normalized_uniform(i: int, l: int, temp: float) -> torch.Tensor:
 
 
 def continous_annealing(step: int):
-    total_steps = 1e6
+    total_steps = 1e5
     return math.exp(-0.5 * math.log(total_steps) * step / total_steps)
 
 
@@ -368,9 +369,11 @@ def uct_search(
     opponent_player: int,
     deterministic: bool = False,
     action_decoder: Optional[ContinousActionDecoder] = None,
-    action_encoder: Optional[Callable[[int], torch.Tensor]] = None, # f (int) -> torch.tensor
+    action_encoder: Optional[Callable[[int], torch.Tensor]] = None,  # f (int) -> torch.tensor
     step: int = 0,
-    distance_projection: Optional[Callable[[float, float], torch.Tensor]] = None, # function that maps a discrete action and the predicted distance from that action to a probability distribution over actions 
+    distance_projection: Optional[
+        Callable[[float, float], torch.Tensor]
+    ] = None,  # function that maps a discrete action and the predicted distance from that action to a probability distribution over actions
 ) -> Tuple[int, np.ndarray, float]:
     """Single-threaded Upper Confidence Bound (UCB) for Trees (UCT) search without any rollout.
 
@@ -418,20 +421,25 @@ def uct_search(
     network_output = network.initial_inference(state[None, ...])
     prior_prob = network_output.pi_probs
     root_node = Node(prior=0.0)
-    
+
     if action_decoder is not None:
+        annealing_temp = continous_annealing(step)
         if distance_projection is not None:
-            index, distance = action_decoder.index(torch.tensor(prior_prob).unsqueeze(0), return_dist=True)
-            prior_prob = distance_projection(index.item(), distance.item())
+            noised_policy = torch.tensor(prior_prob) + torch.randn_like(torch.tensor(prior_prob)) * annealing_temp * 0.3
+            index, distance = action_decoder.index(noised_policy.unsqueeze(0), return_dist=True)
+            prior_prob = distance_projection(index.item(), distance.item()).numpy()
+            # prior_prob = add_gaussian_noise(prior_prob.numpy(), annealing_temp * 0.3)
+            prior_prob = normalized_uniform(index, len(actions_mask), 0)
         else:
-            selected_action_index = action_decoder.index(torch.tensor(prior_prob).unsqueeze(0)).squeeze().item()
+            noised_policy = torch.tensor(prior_prob) + torch.randn_like(torch.tensor(prior_prob)) * annealing_temp * 0.3
+            selected_action_index = action_decoder.index(noised_policy.unsqueeze(0)).squeeze().item()
             # print(f"actions mask: {actions_mask}")
             # prior_prob = np.zeros(len(actions_mask), dtype=np.float32)
             # prior_prob[selected_action_index] = 1.0
             # prior_prob = normalized_gaussian(selected_action_index, len(actions_mask), temperature)
-            annealing_temp = continous_annealing(step)
+            # annealing_temp = continous_annealing(step)
             prior_prob = normalized_uniform(selected_action_index, len(actions_mask), annealing_temp)
-            if (step % 100 == 0):
+            if step % 100 == 0:
                 logging.debug(f" ======== Step {step} ======== ")
                 logging.debug(f"selected action index: {selected_action_index}")
                 logging.debug(f"temperature: {temperature}")
@@ -440,14 +448,21 @@ def uct_search(
 
     #     # print(f"encoder actions: {len(action_encoder.get_action_embeddings())}; prior: {prior_prob.shape}, mask: {actions_mask.shape}")
     #     prior_prob = np.ones(actions_mask.shape, dtype=np.float32)
-    
-    # Add dirichlet noise to the prior probabilities to root node.
-    if not deterministic and distance_projection is None and config.root_dirichlet_alpha > 0.0 and config.root_exploration_eps > 0.0:
-        prior_prob = add_dirichlet_noise(prior_prob.numpy(), eps=config.root_exploration_eps, alpha=config.root_dirichlet_alpha)
-    else:
-        prior_prob = prior_prob.numpy()
 
-    if (step % 100 == 0):
+    # Add dirichlet noise to the prior probabilities to root node.
+    if (
+        not deterministic
+        and distance_projection is None
+        and config.root_dirichlet_alpha > 0.0
+        and config.root_exploration_eps > 0.0
+    ):
+        if not isinstance(prior_prob, np.ndarray):
+            prior_prob = prior_prob.numpy()
+        prior_prob = add_dirichlet_noise(
+            prior_prob, eps=config.root_exploration_eps, alpha=config.root_dirichlet_alpha
+        )
+
+    if step % 100 == 0:
         logging.info(f"prior prob: {prior_prob}")
     # if distance_projection:
     # Set prior probabilities to zero for illegal actions.
@@ -563,7 +578,9 @@ def continous_uct_search(
 
     # Add dirichlet noise to the prior probabilities to root node.
     if not deterministic and config.root_dirichlet_alpha > 0.0 and config.root_exploration_eps > 0.0:
-        prior_prob = add_dirichlet_noise(prior_prob, eps=config.root_exploration_eps, alpha=config.root_dirichlet_alpha)
+        prior_prob = add_dirichlet_noise(
+            prior_prob, eps=config.root_exploration_eps, alpha=config.root_dirichlet_alpha
+        )
     # Set prior probabilities to zero for illegal actions.
     if actions_mask is not None:
         prior_prob = set_illegal_action_probs_to_zero(actions_mask, prior_prob)

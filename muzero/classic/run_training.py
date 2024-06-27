@@ -14,6 +14,7 @@
 # ==============================================================================
 """Runs MuZero self-play training pipeline on classic control problem like CartPole and LunarLander.
 """
+import logging
 from absl import app
 from absl import flags
 import multiprocessing
@@ -22,12 +23,16 @@ import numpy as np
 import torch
 from torch.optim.lr_scheduler import MultiStepLR
 
+from muzero.continous.debug import NoMatplotFilter
 from muzero.network import MuZeroMLPNet
 from muzero.replay import PrioritizedReplay
 from muzero.config import make_classic_config
 from muzero.gym_env import create_classic_environment
 from muzero.pipeline import run_self_play, run_training, run_data_collector, run_evaluator
 
+logging.basicConfig(level=logging.INFO)
+for handler in logging.root.handlers:
+    handler.addFilter(NoMatplotFilter())
 
 FLAGS = flags.FLAGS
 flags.DEFINE_string('environment_name', 'CartPole-v1', "Classic problem like 'CartPole-v1', 'LunarLander-v2'")

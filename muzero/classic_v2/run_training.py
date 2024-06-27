@@ -50,9 +50,9 @@ flags.DEFINE_integer('batch_size', 128, 'Batch size for traning.')
 flags.DEFINE_integer('replay_capacity', 50000, 'Maximum replay size.')
 flags.DEFINE_integer('min_replay_size', 5000, 'Minimum replay size before start to do traning.')
 flags.DEFINE_float(
-    'priority_exponent', 0.0, 'Priotiry exponent used in prioritized replay, 0 means using uniform random replay.'
+    'priority_exponent', 1.0, 'Priotiry exponent used in prioritized replay, 0 means using uniform random replay.'
 )
-flags.DEFINE_float('importance_sampling_exponent', 0.0, 'Importance sampling exponent value.')
+flags.DEFINE_float('importance_sampling_exponent', 1.0, 'Importance sampling exponent value.')
 
 flags.DEFINE_integer('seed', 1, 'Seed the runtime.')
 
@@ -63,6 +63,11 @@ flags.DEFINE_integer(
     'samples_save_frequency',
     -1,
     'The frequency (measured in number added in replay) to save self-play samples in replay, default -1 do not save.',
+)
+flags.DEFINE_string(
+    'load_checkpoint_file',
+    'checkpoints/CartPole-v1_train_steps_1000',
+    'Load the checkpoint from file.',
 )
 flags.DEFINE_string('samples_save_dir', 'samples', 'Path for save self-play samples in replay to file.')
 flags.DEFINE_string('tag', '', 'Add tag to Tensorboard log file.')
@@ -101,7 +106,7 @@ def main(argv):
     """Trains MuZero agent on classic control problems."""
     del argv
 
-    runtime_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    runtime_device = 'mps' # torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     random_state = np.random.RandomState(FLAGS.seed)  # pylint: disable=no-member
     torch.manual_seed(FLAGS.seed)
     if torch.backends.cudnn.enabled:
@@ -119,7 +124,7 @@ def main(argv):
     tokenizer = AutoTokenizer.from_pretrained(
         "EleutherAI/pythia-70m-deduped",
         revision="step3000",
-        device_map="mps",
+        device_map="cpu",
     )
     tokenizer.add_special_tokens({'pad_token': '[PAD]'})
     tokenized_actions = tokenizer(actions, return_tensors="pt", padding=True, truncation=True)
@@ -163,7 +168,9 @@ def main(argv):
     optimizer = None  # torch.optim.Adam(network.parameters(), lr=config.lr_init, weight_decay=config.weight_decay)
     lr_scheduler = None  # MultiStepLR(optimizer, milestones=config.lr_milestones, gamma=config.lr_decay_rate)
 
+    action_encoder = ContinousActionEncoder(device='cpu')
     action_decoder = ContinousActionDecoder(action_embeddings.clone())
+
     actor_network = ContinousMuzeroNet(
         action_encoder,
         action_decoder,
@@ -180,7 +187,9 @@ def main(argv):
 
     actor_network.share_memory()
 
+    action_encoder = ContinousActionEncoder(device='cpu')
     action_decoder = ContinousActionDecoder(action_embeddings.clone())
+
     new_ckpt_network = ContinousMuzeroNet(
         action_encoder,
         action_decoder,
@@ -241,6 +250,7 @@ def main(argv):
     )
     learner.start()
 
+    action_encoder = ContinousActionEncoder(device='cpu')
     action_encoder = ActionEncoderWith(action_embeddings.clone())
     
     # Start evaluation loop on a seperate process.
@@ -256,7 +266,7 @@ def main(argv):
             stop_event,
             tag,
             1,
-            True,
+            False,
             use_distance,
             action_decoder,
             action_encoder,
@@ -292,7 +302,7 @@ def main(argv):
                 train_steps_counter,
                 stop_event,
                 tag,
-                True,
+                False,
                 use_distance,
                 action_decoder,
                 action_encoder,

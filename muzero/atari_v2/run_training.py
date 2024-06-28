@@ -13,6 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 """Runs MuZero self-play training pipeline on Atari game."""
+from typing import Optional
 from absl import app
 from absl import flags
 from absl import logging
@@ -23,53 +24,56 @@ import numpy as np
 import torch
 
 from muzero.network import MuZeroAtariNet
-from muzero.continous import ContinousActionDecoder, ContinousActionEncoder, ContinousMuzeroNet, VitConfig, tokenizer
+from muzero.continous.io import ContinousActionDecoder, ContinousActionEncoder, VitConfig
+from muzero.continous.net import ContinousMuzeroNet
 from muzero.replay import PrioritizedReplay
 from muzero.config import make_atari_config
 from muzero.gym_env import create_atari_environment
 from muzero.pipeline import run_self_play, run_training, run_data_collector, run_evaluator, load_checkpoint, load_from_file
+from pydantic import BaseModel
 
-FLAGS = flags.FLAGS
-flags.DEFINE_string('environment_name', 'Breakout', 'Classic problem like Breakout, Pong etc.')
-flags.DEFINE_integer('environment_height', 224, 'Environment frame screen height.')
-flags.DEFINE_integer('environment_width', 224, 'Environment frame screen width.')
-flags.DEFINE_integer('environment_frame_skip', 4, 'Number of frames to skip.')
-flags.DEFINE_integer('environment_frame_stack', 16, 'Number of frames to stack.')
-flags.DEFINE_integer('max_episode_steps', 108000, 'Maximum steps (before frame skip) per episode.')
-flags.DEFINE_bool('gray_scale', False, 'Gray scale observation image.')
-flags.DEFINE_bool('clip_reward', True, 'Clip reward in the range [-1, 1], default on.')
-flags.DEFINE_bool('done_on_life_loss', True, 'End of game if loss a life, default on.')
-flags.DEFINE_integer('num_actors', 4, 'Number of self-play actor processes.')
+class EnvironmentConfig(BaseModel):
+    name: str = 'Breakout'
+    height: int = 224
+    width: int = 224
+    frame_skip: int = 4
+    frame_stack: int = 16
+    max_episode_steps: int = 108000
+    gray_scale: bool = False
+    clip_reward: bool = True
+    done_on_life_loss: bool = True
+    num_actors: int = 4
 
-flags.DEFINE_integer('num_training_steps', int(10e6), 'Number of traning steps.')
-flags.DEFINE_integer('batch_size', 128, 'Batch size for training.')
-flags.DEFINE_integer('replay_capacity', int(1e6), 'Maximum replay size.')
-flags.DEFINE_integer('min_replay_size', 1000, 'Minimum replay size before start to do traning.')
-flags.DEFINE_float(
-    'priority_exponent', 1.0, 'Priotiry exponent used in prioritized replay, 0 means using uniform random replay.'
-)
-flags.DEFINE_float('importance_sampling_exponent', 1.0, 'Importance sampling exponent value.')
+class TrainingConfig(BaseModel):
+    num_training_steps: int = int(10e6)
+    batch_size: int = 128
+    replay_capacity: int = int(1e6)
+    min_replay_size: int = 1000
+    priority_exponent: float = 1.0
+    importance_sampling_exponent: float = 1.0
 
-flags.DEFINE_integer('seed', 1, 'Seed the runtime.')
-flags.DEFINE_bool('use_tensorboard', True, 'Monitor performance with Tensorboard, default on.')
-flags.DEFINE_bool('clip_grad', True, 'Clip gradient, default off.')
+class RuntimeConfig(BaseModel):
+    seed: int = 1
+    use_tensorboard: bool = True
+    clip_grad: bool = True
 
-flags.DEFINE_string('checkpoint_dir', 'checkpoints', 'Path for save checkpoint files.')
-flags.DEFINE_string(
-    'load_checkpoint_file',
-    'checkpoints/BreakoutNoFrameskip-v4_train_steps_1000',
-    # '',
-    'Load the checkpoint from file.',
-)
+class CheckpointConfig(BaseModel):
+    checkpoint_dir: str = 'checkpoints'
+    load_checkpoint_file: Optional[str] = None
 
-flags.DEFINE_integer(
-    'samples_save_frequency',
-    -1,
-    'The frequency (measured in number added in replay) to save self-play samples in replay, default -1 do not save.',
-)
-flags.DEFINE_string('samples_save_dir', 'samples', 'Path for save self-play samples in replay to file.')
-flags.DEFINE_string('load_samples_file', '', 'Load the replay samples from file.')
-flags.DEFINE_string('tag', '', 'Add tag to Tensorboard log file.')
+class SamplesConfig(BaseModel):
+    save_frequency: int = -1
+    save_dir: str = 'samples'
+    load_samples_file: Optional[str] = ''
+    tag: Optional[str] = ''
+
+
+class Config(BaseModel):
+    environment: EnvironmentConfig = EnvironmentConfig()
+    training: TrainingConfig = TrainingConfig()
+    runtime: RuntimeConfig = RuntimeConfig()
+    checkpoint: CheckpointConfig = CheckpointConfig()
+    samples: SamplesConfig = SamplesConfig()
 
 
 class ActionEncoderWith():
@@ -85,23 +89,23 @@ class ActionEncoderWith():
 def main(argv):
     """Trains MuZero agent on Atari games."""
     del argv
-
+    config = Config()
     # runtime_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     runtime_device = torch.device('mps')
-    random_state = np.random.RandomState(FLAGS.seed)  # pylint: disable=no-member
-    torch.manual_seed(FLAGS.seed)
+    random_state = np.random.RandomState(config.runtime.seed)  # pylint: disable=no-member
+    torch.manual_seed(config.runtime.seed)
     if torch.backends.cudnn.enabled:
         torch.backends.cudnn.benchmark = False
         torch.backends.cudnn.deterministic = True
 
     def environment_builder():
         return create_atari_environment(
-            env_name=FLAGS.environment_name,
-            screen_height=FLAGS.environment_height,
-            screen_width=FLAGS.environment_width,
-            frame_skip=FLAGS.environment_frame_skip,
-            frame_stack=FLAGS.environment_frame_stack,
-            max_episode_steps=FLAGS.max_episode_steps,
+            env_name=config.environment.name,
+            screen_height=config.environment.height,
+            screen_width=config.environment.width,
+            frame_skip=config.environment.frame_skip,
+            frame_stack=config.environment.frame_stack,
+            max_episode_steps=config.environment.max_episode_steps,
             seed=random_state.randint(1, 2**31),
             noop_max=30,
             terminal_on_life_loss=False,
@@ -110,7 +114,7 @@ def main(argv):
             resize_and_gray=False
         )
 
-    self_play_envs, self_play_actions = zip(*[environment_builder() for _ in range(FLAGS.num_actors)])
+    self_play_envs, self_play_actions = zip(*[environment_builder() for _ in range(config.environment.num_actors)])
 
     eval_env, eval_actions = environment_builder()
 
@@ -118,15 +122,15 @@ def main(argv):
     num_actions = self_play_envs[0].action_space.n
 
     tag = self_play_envs[0].spec.id
-    if FLAGS.tag is not None and FLAGS.tag != '':
-        tag = f'{tag}_{FLAGS.tag}'
+    if config.samples.tag is not None and config.samples.tag != '':
+        tag = f'{tag}_{config.samples.tag}'
 
-    config = make_atari_config(
-        num_training_steps=FLAGS.num_training_steps,
-        batch_size=FLAGS.batch_size,
-        min_replay_size=FLAGS.min_replay_size,
-        use_tensorboard=FLAGS.use_tensorboard,
-        clip_grad=FLAGS.clip_grad,
+    atari_config = make_atari_config(
+        num_training_steps=config.training.num_training_steps,
+        batch_size=config.training.batch_size,
+        min_replay_size=config.training.min_replay_size,
+        use_tensorboard=config.runtime.use_tensorboard,
+        clip_grad=config.runtime.clip_grad,
     )
     
     formatted_actions = [f"action: {action}" for action in eval_actions]
@@ -151,10 +155,10 @@ def main(argv):
         action_embeddings.shape[-1],
         VitConfig(),
         512,
-        config.num_planes,
-        config.value_support_size,
-        config.reward_support_size,
-        FLAGS.environment_frame_stack,
+        atari_config.num_planes,
+        atari_config.value_support_size,
+        atari_config.reward_support_size,
+        config.environment.frame_stack,
         8, # attention heads
     )
 
@@ -165,10 +169,10 @@ def main(argv):
         action_embeddings.shape[-1],
         VitConfig(),
         512,
-        config.num_planes,
-        config.value_support_size,
-        config.reward_support_size,
-        FLAGS.environment_frame_stack,
+        atari_config.num_planes,
+        atari_config.value_support_size,
+        atari_config.reward_support_size,
+        config.environment.frame_stack,
         8, # attention heads
     )
     
@@ -181,10 +185,10 @@ def main(argv):
         action_embeddings.shape[-1],
         VitConfig(),
         512,
-        config.num_planes,
-        config.value_support_size,
-        config.reward_support_size,
-        FLAGS.environment_frame_stack,
+        atari_config.num_planes,
+        atari_config.value_support_size,
+        atari_config.reward_support_size,
+        config.environment.frame_stack,
         8, # attention heads
     )
 
@@ -201,9 +205,9 @@ def main(argv):
     # print(f"decoder device new_ckpt: {[t.device for t in new_ckpt_network.action_decoder.action_set]}")
 
     replay = PrioritizedReplay(
-        FLAGS.replay_capacity,
-        FLAGS.priority_exponent,
-        FLAGS.importance_sampling_exponent,
+        config.training.replay_capacity,
+        config.training.priority_exponent,
+        config.training.importance_sampling_exponent,
         random_state,
     )
 
@@ -219,8 +223,8 @@ def main(argv):
     train_steps_counter = multiprocessing.Value('i', 0)
 
     # Load states from checkpoint to resume training.
-    if FLAGS.load_checkpoint_file is not None and os.path.isfile(FLAGS.load_checkpoint_file):
-        loaded_state = load_checkpoint(FLAGS.load_checkpoint_file, 'cpu')
+    if config.checkpoint.load_checkpoint_file is not None and os.path.isfile(config.checkpoint.load_checkpoint_file):
+        loaded_state = load_checkpoint(config.checkpoint.load_checkpoint_file, 'cpu')
         network.load_state_dict(loaded_state['network'])
         optimizer_state = loaded_state['optimizer']
         scheduler_state = loaded_state['lr_scheduler']
@@ -228,27 +232,27 @@ def main(argv):
 
         actor_network.load_state_dict(loaded_state['network'])
 
-        logging.info(f'Loaded state from checkpoint {FLAGS.load_checkpoint_file}')
+        logging.info(f'Loaded state from checkpoint {config.checkpoint.load_checkpoint_file}')
         logging.info(f'Current state: train steps {train_steps_counter.value}, learing rate {scheduler_state.get("last_lr")}')
     else:
-        logging.warn(f"could not load checkpoint file {FLAGS.load_checkpoint_file}")
+        logging.warn(f"could not load checkpoint file {config.checkpoint.load_checkpoint_file}")
         optimizer_state = None
         scheduler_state = None
 
     # Load replay samples
-    if FLAGS.load_samples_file is not None and os.path.isfile(FLAGS.load_samples_file):
+    if config.samples.load_samples_file is not None and os.path.isfile(config.samples.load_samples_file):
         try:
             replay.reset()
-            replay_state = load_from_file(FLAGS.load_samples_file)
+            replay_state = load_from_file(config.samples.load_samples_file)
             replay.set_state(replay_state)
-            logging.info(f"Loaded replay samples from file '{FLAGS.load_samples_file}'")
+            logging.info(f"Loaded replay samples from file '{config.samples.load_samples_file}'")
         except Exception:
             pass
 
     # Start to collect samples from self-play on a new thread.
     data_collector = threading.Thread(
         target=run_data_collector,
-        args=(data_queue, replay, FLAGS.samples_save_frequency, FLAGS.samples_save_dir, tag),
+        args=(data_queue, replay, config.samples.save_frequency, config.samples.save_dir, tag),
     )
     data_collector.start()
 
@@ -265,7 +269,7 @@ def main(argv):
             replay,
             data_queue,
             train_steps_counter,
-            FLAGS.checkpoint_dir,
+            config.checkpoint.checkpoint_dir,
             checkpoint_files,
             stop_event,
             tag,
@@ -296,17 +300,17 @@ def main(argv):
 
     # # Start self-play processes.
     actors = []
-    for i in range(FLAGS.num_actors):
+    for i in range(config.environment.num_actors):
         action_decoder = ContinousActionDecoder(action_embeddings.clone())
         net_config = {
             "action_encoder": ContinousActionEncoder(),
             "action_decoder": action_decoder,
             "action_space_dim": action_embeddings.shape[-1],
             "vit_config": VitConfig(),
-            "num_planes": config.num_planes,
-            "value_support_size": config.value_support_size,
-            "reward_support_size": config.reward_support_size,
-            "sequence_length": FLAGS.environment_frame_stack,
+            "num_planes": atari_config.num_planes,
+            "value_support_size": atari_config.value_support_size,
+            "reward_support_size": atari_config.reward_support_size,
+            "sequence_length": config.environment.frame_stack,
             "attention_heads": 8, # attention heads
         }
         actor = multiprocessing.Process(

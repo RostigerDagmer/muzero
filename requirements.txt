@@ -2,6 +2,7 @@
 
 # Logging and parse args
 absl-py==1.0.0
+pydantic==2.7.4
 
 # Gym environment
 gym==0.23.1

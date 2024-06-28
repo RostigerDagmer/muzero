@@ -14,12 +14,14 @@
 # ==============================================================================
 """Runs MuZero self-play training pipeline on classic control problem like CartPole and LunarLander.
 """
+from typing import Optional
 from absl import app
 from absl import flags
 import multiprocessing
 import threading
 import gym
 import numpy as np
+from pydantic import BaseModel
 import torch
 from transformers import AutoTokenizer
 import logging
@@ -41,38 +43,26 @@ logging.basicConfig(level=logging.INFO)
 for handler in logging.root.handlers:
     handler.addFilter(NoMatplotFilter())
 
-FLAGS = flags.FLAGS
-flags.DEFINE_string('environment_name', 'CartPole-v1', "Classic problem like 'CartPole-v1', 'LunarLander-v2'")
-flags.DEFINE_integer('stack_history', 4, 'Stack last N states and actions.')
-flags.DEFINE_integer('num_actors', 6, 'Number of self-play actor processes.')
-flags.DEFINE_integer('num_training_steps', 100000, 'Number of traning steps.')
-flags.DEFINE_integer('batch_size', 128, 'Batch size for traning.')
-flags.DEFINE_integer('replay_capacity', 50000, 'Maximum replay size.')
-flags.DEFINE_integer('min_replay_size', 5000, 'Minimum replay size before start to do traning.')
-flags.DEFINE_float(
-    'priority_exponent', 1.0, 'Priotiry exponent used in prioritized replay, 0 means using uniform random replay.'
-)
-flags.DEFINE_float('importance_sampling_exponent', 1.0, 'Importance sampling exponent value.')
+class Flags(BaseModel):
+    environment_name: str = 'CartPole-v1'
+    stack_history: int = 4
+    num_actors: int = 6
+    num_training_steps: int = 100000
+    batch_size: int = 128
+    replay_capacity: int = 50000
+    min_replay_size: int = 5000
+    priority_exponent: float = 0.0
+    importance_sampling_exponent: float = 0.0
+    seed: int = 1
+    use_tensorboard: bool = True
+    clip_grad: bool = False
+    checkpoint_dir: str = 'checkpoints'
+    checkpoint_file: Optional[str] = None
+    samples_save_frequency: int = -1
+    samples_save_dir: str = 'samples'
+    tag: str = ''
 
-flags.DEFINE_integer('seed', 1, 'Seed the runtime.')
-
-flags.DEFINE_bool('use_tensorboard', True, 'Monitor performance with Tensorboard, default on.')
-flags.DEFINE_bool('clip_grad', False, 'Clip gradient, default off.')
-flags.DEFINE_string('checkpoint_dir', 'checkpoints', 'Path for save checkpoint files.')
-flags.DEFINE_integer(
-    'samples_save_frequency',
-    -1,
-    'The frequency (measured in number added in replay) to save self-play samples in replay, default -1 do not save.',
-)
-flags.DEFINE_string(
-    'load_checkpoint_file',
-    'checkpoints/CartPole-v1_train_steps_1000',
-    'Load the checkpoint from file.',
-)
-flags.DEFINE_string('samples_save_dir', 'samples', 'Path for save self-play samples in replay to file.')
-flags.DEFINE_string('tag', '', 'Add tag to Tensorboard log file.')
-
-
+FLAGS = Flags()
 
 class ActionEncoderWith():
     def __init__(self, action_embeddings: torch.Tensor):

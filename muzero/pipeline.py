@@ -49,6 +49,7 @@ from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 O = TypeVar('O')
 A = TypeVar('A')
 
+
 @torch.no_grad()
 def run_self_play(
     config: MuZeroConfig,
@@ -56,7 +57,7 @@ def run_self_play(
     network_config: dict[Any, Any] | MuZeroNet,
     device: torch.device,
     env: gym.Env[O, A],
-    data_queue: multiprocessing.SimpleQueue, #[tuple[Transition, float]],
+    data_queue: multiprocessing.SimpleQueue,  # [tuple[Transition, float]],
     train_steps_counter: multiprocessing.Value,
     stop_event: multiprocessing.synchronize.Event,
     tag: Optional[str] = None,
@@ -97,13 +98,13 @@ def run_self_play(
 
     network = network.to(device=device)
 
-    logging.debug("actor device: ", [p.device for p in network.parameters()])
+    logging.debug(f"actor device: {[p.device for p in network.parameters()]}")
     network.eval()
     game = 0
 
     while not stop_event.is_set():  # For each new game.
         obs = env.reset()
-        logging.debug(" ================= obs shape: ", obs.shape)
+        logging.debug(f" ================= obs shape: {obs.shape}")
         done = False
         episode_trajectory = []
         steps = 0
@@ -127,12 +128,12 @@ def run_self_play(
                 step=train_steps_counter.value + steps,
                 distance_projection=use_distance,
             )
-            
+
             logging.info(f"predicted action: {action}")
             logging.debug(f"probabilistic choice: {pi_prob.argmax()}")
 
             next_obs, reward, done, _ = env.step(action)
-            logging.debug(" ================= next_obs shape: ", next_obs.shape)
+            logging.debug(f" ================= next_obs shape: {next_obs.shape}")
             steps += 1
             action = action if action_encoder is None else action_encoder(action)
             pi_prob = pi_prob if action_encoder is None else action_encoder(pi_prob.argmax()).cpu().numpy()
@@ -140,9 +141,9 @@ def run_self_play(
                 tracker.step(reward, done, continous_annealing(train_steps_counter.value + steps))
 
             if not isinstance(action, torch.Tensor):
-                logging.debug(" ================= action: ", action)
-                logging.debug(" ================= type(action): ", type(action))
-                logging.debug(" ================= step: ", steps)
+                logging.debug(f" ================= action: {action}")
+                logging.debug(f" ================= type(action): {type(action)}")
+                logging.debug(f" ================= step: {steps}")
             episode_trajectory.append((obs, action, reward, pi_prob, root_value, player_id))
             obs = next_obs
 
@@ -192,17 +193,18 @@ def run_self_play(
 
         priorities = np.abs(np.array(root_values) - np.array(target_values))
 
-        logging.debug(" ================= len(episode_trajectory): ", len(episode_trajectory))
+        logging.debug(f" ================= len(episode_trajectory): {len(episode_trajectory)}")
         logging.debug(" ================= sending full sequence")
         # Make unroll sequences and send to learner.
         try:
+            actions = [torch.tensor(a) for a in actions]
             for transition, priority in make_unroll_sequence(
                 observations, actions, rewards, pi_probs, target_values, priorities, config.unroll_steps
             ):
                 data_queue.put((transition, priority))
         except Exception as e:
-            logging.debug(" ================= error: ", e)
-            logging.debug(" ================= actions: ", actions)
+            logging.error(f" ================= error: {e}")
+            logging.error(f" ================= actions: {actions}")
 
         del episode_trajectory[:]
         del (observations, actions, rewards, pi_probs, root_values, priorities, player_ids, target_values)
@@ -217,6 +219,7 @@ def collect_grad_means(model: torch.nn.Module) -> list[Tuple[str, float]]:
             mean_grad = param.grad.abs().mean().item()  # Get the mean of the absolute gradient
             grads.append((name, mean_grad))
     return grads
+
 
 def run_training(  # noqa: C901
     config: MuZeroConfig,
@@ -296,25 +299,35 @@ def run_training(  # noqa: C901
             'lr_scheduler': lr_scheduler.state_dict(),
             'train_steps': train_steps_counter.value,
         }
-    
-    grads = None
 
+    grads = None
+    last_log = time.time()
     while True:
         if replay.size < config.min_replay_size or replay.size < config.batch_size:
+            if time.time() - last_log > 10:
+                last_log = time.time()
+                logging.info(f"replay size: {replay.size}")
             continue
 
         if train_steps_counter.value >= config.num_training_steps:
             break
 
         transitions, indices, weights = replay.sample(config.batch_size)
-        # logging.debug(f"Transitions:\n{transitions}")
-        # logging.debug(f"Indices:\n{indices}")
-        # logging.debug(f"Weights:\n{weights}")
+        logging.debug(f"Transitions:\n{transitions}")
+        logging.debug(f"Indices:\n{indices}")
+        logging.debug(f"Weights:\n{weights}")
         weights = torch.from_numpy(weights).to(device=device, dtype=torch.float32)
 
         optimizer.zero_grad()
-        loss, priorities = calc_loss(network, device, transitions, weights)
+        loss, priorities, individual_losses = calc_loss(network, device, transitions, weights)
+
+        reward_loss, value_loss, policy_loss = individual_losses
+        reward_loss = reward_loss.detach().cpu().item()
+        value_loss = value_loss.detach().cpu().item()
+        policy_loss = policy_loss.detach().cpu().item()
+
         loss.backward()
+
 
         # if config.clip_grad:
         #     torch.nn.utils.clip_grad_norm_(network.parameters(), config.max_grad_norm)
@@ -334,7 +347,16 @@ def run_training(  # noqa: C901
         del transitions, indices, weights
 
         for tracker in trackers:
-            tracker.step(loss.detach().cpu().item(), lr_scheduler.get_last_lr()[0], train_steps_counter.value, network, continous_annealing(train_steps_counter.value))
+            tracker.step(
+                loss.detach().cpu().item(),
+                reward_loss,
+                value_loss,
+                policy_loss,
+                lr_scheduler.get_last_lr()[0],
+                train_steps_counter.value,
+                network,
+                continous_annealing(train_steps_counter.value),
+            )
 
         if train_steps_counter.value > 1 and train_steps_counter.value % config.checkpoint_interval == 0:
             state_to_save = get_state_to_save()
@@ -459,7 +481,7 @@ def run_board_game_evaluator(
             )
             if action_decoder is not None:
                 action = action_decoder(action)
-                
+
             obs, _, done, _ = env.step(action)
 
         if env.winner == env.black_player_id:
@@ -559,7 +581,7 @@ def run_evaluator(
                     action_decoder=action_decoder,
                     distance_projection=distance_projection,
                 )
-                
+
                 action = action if action_decoder is not None else action_decoder(action)
 
                 obs, reward, done, _ = env.step(action)
@@ -574,7 +596,7 @@ def run_evaluator(
 
 
 def run_data_collector(
-    data_queue: multiprocessing.SimpleQueue, #[tuple[Transition, float] | str],
+    data_queue: multiprocessing.SimpleQueue,  # [tuple[Transition, float] | str],
     replay: PrioritizedReplay[Transition],
     save_frequency: int,
     save_dir: Optional[str],
@@ -632,6 +654,84 @@ def calc_loss(
     device: torch.device,
     transitions: Transition,
     weights: torch.Tensor,
+) -> Tuple[torch.Tensor, np.ndarray, tuple[torch.Tensor]]:
+    """Given a network and batch of transitions, compute the loss for MuZero agent."""
+    # [B, state_shape]
+    state = torch.from_numpy(transitions.state).to(device=device, dtype=torch.float32, non_blocking=True)
+    # [B, T]
+    action = torch.from_numpy(transitions.action).to(device=device, dtype=torch.long, non_blocking=True)
+    target_value_scalar = torch.from_numpy(transitions.value).to(device=device, dtype=torch.float32, non_blocking=True)
+    target_reward_scalar = torch.from_numpy(transitions.reward).to(
+        device=device, dtype=torch.float32, non_blocking=True
+    )
+    # [B, T, num_actions]
+    target_pi_prob = torch.from_numpy(transitions.pi_prob).to(device=device, dtype=torch.float32, non_blocking=True)
+
+    # Convert scalar targets into transformed support (probabilities).
+    if network.mse_loss_for_value:
+        target_value = target_value_scalar
+    else:
+        # [B, T, num_actions]
+        target_value = scalar_to_categorical_probabilities(target_value_scalar, network.value_support_size)
+    if network.mse_loss_for_reward:
+        target_reward = target_reward_scalar
+    else:
+        # [B, T, num_actions]
+        target_reward = scalar_to_categorical_probabilities(target_reward_scalar, network.reward_support_size)
+
+    B, T = action.shape
+    reward_loss, value_loss, policy_loss = (0, 0, 0)
+    loss_scale = 1.0 / T
+
+    pred_values = []
+
+    # Get initial hidden state.
+    hidden_state = network.represent(state)
+
+    # Unroll K steps.
+    for t in range(T):
+        pred_pi_logits, pred_value = network.prediction(hidden_state)
+        hidden_state, pred_reward = network.dynamics(hidden_state, action[:, t].unsqueeze(1))
+
+        # Scale the gradient for dynamics function by 0.5.
+        hidden_state.register_hook(lambda grad: grad * 0.5)
+
+        value_loss += loss_func(pred_value.squeeze(), target_value[:, t], network.mse_loss_for_value)
+
+        # Shouldn't we exclude the reward loss for board games as stated in the paper?
+        reward_loss += loss_func(pred_reward.squeeze(), target_reward[:, t], network.mse_loss_for_reward)
+        policy_loss += loss_func(pred_pi_logits, target_pi_prob[:, t])
+
+        pred_values.append(pred_value.detach())
+
+    loss = reward_loss + value_loss + policy_loss
+
+    # Scale loss using importance sampling weights, then average over batch dimension B.
+    loss = torch.mean(loss * weights.detach())
+
+    # Scale the loss by 1/unroll_steps.
+    loss.register_hook(lambda grad: grad * loss_scale)
+
+    # Using the delta between predicted values and target values as priorities.
+    with torch.no_grad():
+        pred_values = torch.stack(pred_values, dim=1)
+        if network.mse_loss_for_value:
+            pred_values_scalar = pred_values.squeeze(-1)
+        else:
+            pred_values_scalar = logits_to_transformed_expected_value(pred_values, network.value_support_size).squeeze(
+                -1
+            )
+        priorities = (pred_values_scalar[:, 0] - target_value_scalar[:, 0]).abs().cpu().numpy()
+        # priorities = torch.mean(pred_values_scalar - target_value_scalar, dim=-1).abs().cpu().numpy()
+
+    return loss, priorities, (reward_loss, value_loss, policy_loss)
+
+
+def _calc_loss(
+    network: MuZeroNet,
+    device: torch.device,
+    transitions: Transition,
+    weights: torch.Tensor,
 ) -> Tuple[torch.Tensor, np.ndarray]:
     """Given a network and batch of transitions, compute the loss for MuZero agent."""
     # [B, state_shape]
@@ -639,13 +739,17 @@ def calc_loss(
     # logging.debug(f"state.shape: {state.shape}")
     # [B, T]
     action = torch.from_numpy(transitions.action).to(device=device, dtype=torch.long, non_blocking=True)
-    
+
     # logging.debug("action shape in loss: ", action.shape)
-    target_value_scalar = torch.from_numpy(transitions.value).to(device=device, dtype=torch.float32, non_blocking=True).unsqueeze(-1)
+    target_value_scalar = (
+        torch.from_numpy(transitions.value).to(device=device, dtype=torch.float32, non_blocking=True).unsqueeze(-1)
+    )
 
     # logging.debug("target_value_scalar shape: ", target_value_scalar.shape)
-    target_reward_scalar = torch.from_numpy(transitions.reward).to(device=device, dtype=torch.float32, non_blocking=True).unsqueeze(-1)
-    
+    target_reward_scalar = (
+        torch.from_numpy(transitions.reward).to(device=device, dtype=torch.float32, non_blocking=True).unsqueeze(-1)
+    )
+
     # logging.debug("target_reward_scalar shape: ", target_reward_scalar.shape)
     # [B, T, num_actions]
     # the vector that was predicted by the policy head of the network
@@ -658,16 +762,16 @@ def calc_loss(
     # logging.debug("selected_action_idx: ", selected_action_idx)
     # get every other action in network.action_decoder.action_set
     # selected_action_idx has size [B, T]
-#     non_targets = []
-# #    logging.debug("not selected", no_select)
-#     for B in range(target_pi_prob.shape[0]):
-#         for i in range(target_pi_prob.shape[1]):
-#             # logging.debug(f"Best match for {network.action_decoder.action_set[B,i]} is {selected_action_idx[B][i]}")
-#             not_selected = network.action_decoder.action_set[~(network.action_decoder.action_set == selected_action_idx[B][i]).all(dim=-1)]
-#             non_targets.append(not_selected)
+    #     non_targets = []
+    # #    logging.debug("not selected", no_select)
+    #     for B in range(target_pi_prob.shape[0]):
+    #         for i in range(target_pi_prob.shape[1]):
+    #             # logging.debug(f"Best match for {network.action_decoder.action_set[B,i]} is {selected_action_idx[B][i]}")
+    #             not_selected = network.action_decoder.action_set[~(network.action_decoder.action_set == selected_action_idx[B][i]).all(dim=-1)]
+    #             non_targets.append(not_selected)
 
     # logging.debug("non_targets_shape")
-    
+
     # logging.debug("target_pi_prob shape: ", target_pi_prob.shape)
     # Convert scalar targets into transformed support (probabilities).
     # if network.mse_loss_for_value:
@@ -689,8 +793,7 @@ def calc_loss(
     # logging.debug("T: ", T)
     # logging.debug("V: ", V)
     reward_loss, value_loss, policy_loss = (0, 0, 0)
-    loss_scale = 1.0 # / T
-
+    loss_scale = 1.0  # / T
 
     # target_value = target_value_scalar.unsqueeze(-1).expand(B, T)
     # target_reward = target_reward_scalar.unsqueeze(-1).expand(B, T)
@@ -731,7 +834,7 @@ def calc_loss(
         # logging.debug("t_v: ", t_v)
         value_loss += loss_func(pred_value.squeeze(), t_v, mse=True, cosine=False) * T
         # logging.debug("value_loss: ", value_loss)
-        
+
         # Shouldn't we exclude the reward loss for board games as stated in the paper?
         # logging.debug("pred_reward shape: ", pred_reward.shape)
         # logging.debug("target_reward shape: ", target_reward.shape)
@@ -746,7 +849,7 @@ def calc_loss(
         # logging.debug("target_pi_prob shape: ", target_pi_prob.shape)
         # logging.debug(" Policy net: ")
         # TODO: in case of continous~categorical (classical control)
-        #       we need a way to steer output intensity (maybe vector magnitude) 
+        #       we need a way to steer output intensity (maybe vector magnitude)
         policy_loss += loss_func(pred_pi_logits, target_pi_prob[:, t])
         # policy_loss += margin_cosine_embedding_loss(pred_pi_logits, target_pi_prob[:, t], non_targets=non_targets)
         # logging.debug("policy_loss: ", policy_loss)
@@ -758,7 +861,7 @@ def calc_loss(
     # logging.debug("value_loss sum(): ", value_loss.sum())
     # logging.debug("policy_loss sum(): ", policy_loss.sum())
 
-    loss = reward_loss + value_loss + policy_loss # + lambda_coefficient * regularization_term
+    loss = reward_loss + value_loss + policy_loss  # + lambda_coefficient * regularization_term
     # logging.debug("loss shape: ", loss.shape)
     # logging.debug("weights shape: ", weights.shape)
 
@@ -778,7 +881,7 @@ def calc_loss(
         #     pred_values_scalar = pred_values.squeeze(-1)
         # else:
         pred_values_scalar = logits_to_transformed_expected_value(pred_values, network.value_support_size).squeeze(-1)
-        
+
         # logging.debug("pred_values_scalar shape: ", pred_values_scalar.shape)
         # logging.debug("target_value shape: ", target_value.shape)
         priorities = (pred_values_scalar - target_value_scalar.squeeze(-1)).abs().cpu().numpy()
@@ -787,7 +890,10 @@ def calc_loss(
 
     return loss, priorities
 
-def margin_cosine_embedding_loss(prediction: torch.Tensor, target: torch.Tensor, non_targets: torch.Tensor, margin: float = 0.1):
+
+def margin_cosine_embedding_loss(
+    prediction: torch.Tensor, target: torch.Tensor, non_targets: torch.Tensor, margin: float = 0.1
+):
     # Normalize the embeddings to prevent scale issues affecting the cosine distance
     prediction_norm = F.normalize(prediction, p=2, dim=1)
     target_norm = F.normalize(target, p=2, dim=1)
@@ -809,6 +915,7 @@ def margin_cosine_embedding_loss(prediction: torch.Tensor, target: torch.Tensor,
     # The final loss is a sum of the positive loss and the average negative loss
     total_loss = positive_loss.mean() + negative_loss.mean()
     return total_loss
+
 
 def loss_func(prediction: torch.Tensor, target: torch.Tensor, mse: bool = False, cosine: bool = True) -> torch.Tensor:
     """Loss function for MuZero agent's value and reward."""
@@ -840,7 +947,9 @@ def loss_func(prediction: torch.Tensor, target: torch.Tensor, mse: bool = False,
     return F.cross_entropy(prediction, target, reduction='none')
 
 
-def compute_n_step_target(rewards: List[float], root_values: List[float], td_steps: int, discount: float) -> List[float]:
+def compute_n_step_target(
+    rewards: List[float], root_values: List[float], td_steps: int, discount: float
+) -> List[float]:
     """Compute n-step target for Atari and classic openAI Gym problems.
 
     zt = ut+1 + γut+2 + ... + γn−1ut+n + γnνt+n
@@ -920,13 +1029,13 @@ def compute_mc_return_target(rewards: List[float], player_ids: List[float]) -> L
 
 def make_unroll_sequence(
     observations: List[np.ndarray],
-    actions: List[np.ndarray],
+    actions: List[torch.Tensor],
     rewards: List[float],
     pi_probs: List[np.ndarray],
     values: List[float],
     priorities: List[float],
     unroll_steps: int,
-) -> Iterable[Transition]:
+) -> Iterable[tuple[Transition, float]]:
     """Turn a lists of episode history into a list of structured transition object,
     and stack unroll_steps for actions, rewards, values, MCTS policy.
 
@@ -966,19 +1075,20 @@ def make_unroll_sequence(
         stacked_reward = np.array(rewards[t:end_index], dtype=np.float32)
         stacked_value = np.array(values[t:end_index], dtype=np.float32)
         stacked_pi_prob = np.array(pi_probs[t:end_index], dtype=np.float32)
-
+        transition = Transition(
+            state=observations[t],  # no stacking for observation, since it is only used to get initial hidden state.
+            action=stacked_action,
+            reward=stacked_reward,
+            value=stacked_value,
+            pi_prob=stacked_pi_prob,
+        )
+        logging.debug(f"transition: {transition}")
         yield (
-            Transition(
-                state=observations[t],  # no stacking for observation, since it is only used to get initial hidden state.
-                action=stacked_action,
-                reward=stacked_reward,
-                value=stacked_value,
-                pi_prob=stacked_pi_prob,
-            ),
+            transition,
             priorities[t],
         )
-        
-        
+
+
 def _make_unroll_sequence(
     observations: List[np.ndarray],
     actions: List[int],
@@ -1029,7 +1139,9 @@ def _make_unroll_sequence(
 
         yield (
             Transition(
-                state=observations[t],  # no stacking for observation, since it is only used to get initial hidden state.
+                state=observations[
+                    t
+                ],  # no stacking for observation, since it is only used to get initial hidden state.
                 action=stacked_action,
                 reward=stacked_reward,
                 value=stacked_value,

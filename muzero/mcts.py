@@ -130,8 +130,8 @@ class Node:
         # else:
         #     print("Weird issue happened")
         #     print("ucb results: ", ucb_results)
-        action_index = np.argmax(ucb_results)
-        best_child = self.children[action_index]
+        # action_index = np.argmax(ucb_results)
+        best_child: Node = self.children[action_index]
 
         return best_child
 
@@ -458,9 +458,11 @@ def uct_search(
     ):
         if not isinstance(prior_prob, np.ndarray):
             prior_prob = prior_prob.numpy()
+        logging.debug(f"before noise: {prior_prob}")
         prior_prob = add_dirichlet_noise(
             prior_prob, eps=config.root_exploration_eps, alpha=config.root_dirichlet_alpha
         )
+        logging.debug(f"after noise: {prior_prob}")
 
     if step % 100 == 0:
         logging.info(f"prior prob: {prior_prob}")
@@ -515,6 +517,7 @@ def uct_search(
         action_index = np.random.choice(np.arange(pi_prob.shape[0]), p=pi_prob)
 
     action = root_node.children[action_index].move
+    logging.debug(f"uct search result:\naction: {action}; pi_prob: {pi_prob}; root value: {root_node.Q}")
     return (action, pi_prob, root_node.Q)
 
 

@@ -111,13 +111,26 @@ class LearnerTracker:
         self._num_steps_since_reset = 0
         self._start = timeit.default_timer()
 
-    def step(self, loss: float, lr: float, train_steps: int, model: Optional[torch.nn.Module], annealing_temp: float = 0.0) -> None:
+    def step(
+        self,
+        loss: float,
+        reward_loss: float,
+        value_loss: float,
+        policy_loss: float,
+        lr: float,
+        train_steps: int,
+        model: Optional[torch.nn.Module],
+        annealing_temp: float = 0.0,
+    ) -> None:
         """Log training loss statistics."""
         self._num_steps_since_reset = train_steps
 
         self._writer.add_scalar('learner(train_steps)/loss', loss, train_steps)
         self._writer.add_scalar('learner(train_steps)/learning_rate', lr, train_steps)
         self._writer.add_scalar('learner(train_steps)/annealing_temp', annealing_temp, train_steps)
+        self._writer.add_scalar('learner(train_steps)/reward_loss', reward_loss, train_steps)
+        self._writer.add_scalar('learner(train_steps)/value_loss', value_loss, train_steps)
+        self._writer.add_scalar('learner(train_steps)/policy_loss', policy_loss, train_steps)
 
         time_stats = self.get_time_stat()
         self._writer.add_scalar('learner(train_steps)/step_rate(minutes)', time_stats['step_rate'] * 60, train_steps)

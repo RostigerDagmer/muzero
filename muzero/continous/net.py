@@ -1,10 +1,13 @@
-from typing import Tuple
+import logging
+from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from muzero.util import normalize_hidden_state
 from .represent import VitConfig, RepresentationViTGeneral, RepresentationLMPythia, RepresentationLMClip
 from .io import ContinousEncoderHead
-from muzero.network import MuZeroNet
+from muzero.network import DynamicsMLPNet, MuZeroNet, PredictionMLPNet
 
 def initialize_weights(net: nn.Module) -> None:
     """Initialize weights for Conv2d and Linear layers using kaming initializer."""
@@ -15,9 +18,9 @@ def initialize_weights(net: nn.Module) -> None:
             if not module.weight.requires_grad:
                 continue
             # nn.init.kaiming_normal_(module.weight, nonlinearity='relu')
-            nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
+            # nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
 
-            # nn.init.xavier_normal_(module.weight)
+            nn.init.xavier_normal_(module.weight)
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
         if isinstance(module, nn.MultiheadAttention):
@@ -64,7 +67,7 @@ class ContinousDynamics(nn.Module):
         hidden_state_ = F.normalize(hidden_state_)
 
         reward_logits = self.reward_net(hidden_state_)
-        reward_logits = F.softmax(reward_logits, dim=1)
+        # reward_logits = F.softmax(reward_logits, dim=1)
         return hidden_state, reward_logits
     
 # class GoalDynamics(nn.Module):
@@ -101,13 +104,11 @@ class ContinousPrediction(nn.Module):
         value_logits = F.softmax(value_logits, dim=1)
         return pi_logits, value_logits
 
-
-
 class ContinousMuzeroNet(MuZeroNet):
     def __init__(
         self,
-        action_encoder: nn.Module,
-        action_decoder: nn.Module,
+        action_encoder: Optional[nn.Module],
+        action_decoder: Optional[nn.Module],
         action_space_dim: int,
         vit_config: VitConfig = VitConfig(),
         hidden_dim: int = 512,
@@ -140,20 +141,36 @@ class ContinousMuzeroNet(MuZeroNet):
                 config=vit_config,
             )
 
-        self.dynamics_net = ContinousDynamics(
-            hidden_dim=hidden_dim,
-            num_planes=num_planes,
-            support_size=reward_support_size,
-            action_space_dim=action_space_dim,
-        )
-        self.prediction_net = ContinousPrediction(
-            hidden_dim=hidden_dim,
-            num_planes=num_planes,
-            support_size=reward_support_size,
-            action_space_dim=action_space_dim,
-        )
+        if action_encoder and action_decoder:
+            self.dynamics_net = ContinousDynamics(
+                hidden_dim=hidden_dim,
+                num_planes=num_planes,
+                support_size=reward_support_size,
+                action_space_dim=action_space_dim,
+            )
+            self.prediction_net = ContinousPrediction(
+                hidden_dim=hidden_dim,
+                num_planes=num_planes,
+                support_size=reward_support_size,
+                action_space_dim=action_space_dim,
+            )
+        else:
+            # we use MLP for Dynamics and Prediction
+            self.dynamics_net = DynamicsMLPNet(
+                num_actions = action_space_dim,
+                num_planes = num_planes,
+                hidden_dim = hidden_dim,
+                support_size = reward_support_size,
+            )
+            self.prediction_net = PredictionMLPNet(
+                num_actions = action_space_dim,
+                num_planes = num_planes,
+                hidden_dim = hidden_dim,
+                support_size = reward_support_size,
+            )
         self.action_encoder = action_encoder
         self.action_decoder = action_decoder
+
         self.value_support_size = value_support_size
         self.reward_support_size = reward_support_size
         initialize_weights(self)
@@ -161,17 +178,22 @@ class ContinousMuzeroNet(MuZeroNet):
     def represent(self, x: torch.Tensor) -> torch.Tensor:
         hidden_state = self.represent_net(x)
         # print("hidden_state", hidden_state.shape)
-        # hidden_state = normalize_hidden_state(hidden_state)
+        # if not self.action_decoder and self.action_encoder:
+        #     hidden_state = normalize_hidden_state(hidden_state)
         return hidden_state
 
     def dynamics(self, hidden_state: torch.Tensor, action: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         hidden_state, reward_logits = self.dynamics_net(hidden_state, action)
         # print("hidden_state", hidden_state.shape)
         # print("reward_logits", reward_logits.shape)
-        # hidden_state = normalize_hidden_state(hidden_state)
+        if not self.action_decoder and self.action_encoder:
+            logging.debug("Normalizing hidden state")
+            hidden_state = normalize_hidden_state(hidden_state)
         return hidden_state, reward_logits
 
     def prediction(self, hidden_state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self.prediction_net(hidden_state)
+        pi_logits, value_logits = self.prediction_net(hidden_state)
+        pi_logits = F.softmax(pi_logits, dim=-1)
+        return pi_logits, value_logits
 
 
